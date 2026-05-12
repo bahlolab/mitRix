@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# mitRix — estimate mtDNA damage from BAM/CRAM coverage ratios
+# mitRix (Basic) — estimate mtDNA damage as a BAM/CRAM coverage ratio
+# that mimics the wet-lab TaqMan Ct ratio.
 #
 # Output (TSV on stdout):
 #   sample  ratio  target  reference  target_mean_cov  ref_mean_cov  ratio_value
 #
-# Defaults assume the rCRS mitochondrial reference (NC_012920.1, 16569 bp).
-# The mtDNA contig name (chrM / MT / chrMT / NC_012920.1) is auto-detected
-# from the BAM/CRAM @SQ header. For mtDNA-CN, the nuclear build (hg19/hg38)
-# is auto-detected from the chr15 contig length; users can override with
-# --reference-bed.
+# Built-in defaults follow the published Thermo Fisher / Picard 4-plex
+# TaqMan amplicons (Trumpff/Picard, rCRS = NC_012920.1, 16569 bp):
 #
-# Default rCRS intervals (1-based, inclusive):
-#   ND1   : 3441-3504
-#   ND4   : 11333-11482
-#   ND5   : 12784-12969
-#   D-loop: 16024-16569 + 1-576  (full control region)
+#   ND1   : chrM:3485-3553       (69 bp)  ← Thermo Assay APAANDG (VIC/MGB)
+#   ND4   : chrM:12087-12170     (84 bp)  ← Thermo Custom CCU002NR (ABY/QSY)
+#   D-loop: chrM:16536-16569 + chrM:1-34  (~67 bp; spans origin)
+#                                          ← Thermo Custom CCU002NR (JUN/QSY)
+#   ND5   : chrM:12784-12969     (186 bp) ← not part of the 4-plex; provided
+#                                            for ND5/ND1 ratio convenience
+#   B2M   : chr15 exon 2 (~282 bp)        ← analog of B2M-FAM/MGB amplicon
+#             hg38: chr15:44,715,439-44,715,720
+#             hg19: chr15:45,007,637-45,007,918
 #
-# B2M (nuclear reference for mtDNA-CN):
-#   hg19 (chr15 length 102,531,392): chr15:45,003,675-45,011,087
-#   hg38 (chr15 length 101,991,189): chr15:44,711,477-44,718,877
+# All defaults are overridable per-side with --target/--reference (range on
+# chrM) or --target-bed/--reference-bed (any chromosome) so labs using a
+# different probe design can plug in their own coordinates.
+#
+# The mtDNA contig name (chrM / MT / chrMT / NC_012920.1) and the nuclear
+# build (hg19 vs hg38, used to pick B2M coordinates for mtDNA-CN) are
+# auto-detected from the BAM/CRAM @SQ header.
 
 set -euo pipefail
 
@@ -27,7 +33,7 @@ PROG="mitrix"
 
 usage() {
   cat >&2 <<USAGE
-${PROG} v${VERSION} — mtDNA damage estimator (coverage ratios)
+${PROG} v${VERSION} (Basic) — mtDNA damage estimator (NGS analog of wet-lab Ct ratio)
 
 USAGE
   ${PROG} --bam FILE [--ratio NAME] [options]
@@ -41,6 +47,13 @@ RATIOS (pick one; default: ND4/ND1)
   --ratio DLOOP/ND1         D-loop / ND1    (control-region coverage)
   --ratio mtDNA-CN          ND1 / B2M       (mtDNA copy number proxy)
   --ratio custom            requires --target AND --reference (or BEDs)
+
+DEFAULT REGIONS (Thermo / Picard 4-plex amplicons)
+  ND1    chrM:3485-3553                    (Thermo APAANDG, VIC/MGB)
+  ND4    chrM:12087-12170                  (Thermo CCU002NR, ABY/QSY)
+  D-loop chrM:16536-16569 + chrM:1-34      (Thermo CCU002NR, JUN/QSY)
+  ND5    chrM:12784-12969                  (not in 4-plex; for ND5/ND1)
+  B2M    chr15 exon 2, build auto-detected (Thermo B2M FAM/MGB analog)
 
 CUSTOM REGIONS  (override either side of the chosen ratio)
   --target START-END        target  interval on chrM (1-based closed)
@@ -87,11 +100,11 @@ KEEP_TMP=0
 NO_HEADER=0
 PRINT_BED=0
 
-# rCRS default intervals (1-based, inclusive)
-ND1_RANGE="3441-3504"
-ND4_RANGE="11333-11482"
-ND5_RANGE="12784-12969"
-DLOOP_RANGES=("1-576" "16024-16569")   # sorted ascending
+# rCRS default intervals (1-based, inclusive) — Thermo/Picard 4-plex amplicons
+ND1_RANGE="3485-3553"
+ND4_RANGE="12087-12170"
+ND5_RANGE="12784-12969"                  # not in 4-plex; sensible default
+DLOOP_RANGES=("1-34" "16536-16569")      # sorted ascending; wraps the origin
 
 # ----- parse args -----
 while (( "$#" )); do
@@ -299,19 +312,19 @@ case "$RATIO" in
       BUILD=$(detect_build "$CHR15_LEN")
       case "$BUILD" in
         hg38/GRCh38)
-          # B2M GRCh38: chr15:44,711,477-44,718,877 (1-based closed)
-          printf '%s\t%s\t%s\n' "$CHR15" 44711476 44718877 > "$R_BED"
+          # B2M exon 2 GRCh38: chr15:44,715,439-44,715,720 (1-based closed)
+          printf '%s\t%s\t%s\n' "$CHR15" 44715438 44715720 > "$R_BED"
           ;;
         hg19/GRCh37)
-          # B2M GRCh37: chr15:45,003,675-45,011,087
-          printf '%s\t%s\t%s\n' "$CHR15" 45003674 45011087 > "$R_BED"
+          # B2M exon 2 GRCh37: chr15:45,007,637-45,007,918
+          printf '%s\t%s\t%s\n' "$CHR15" 45007636 45007918 > "$R_BED"
           ;;
         *)
           log "could not auto-detect nuclear build from chr15 length=$CHR15_LEN."
           log "For B2M coordinates on your reference, supply --reference-bed FILE."
-          log "Reference BED examples (1-based closed coords):"
-          log "  hg19/GRCh37: chr15\t45003674\t45011087  (B2M)"
-          log "  hg38/GRCh38: chr15\t44711476\t44718877  (B2M)"
+          log "Reference BED examples (1-based closed coords; B2M exon 2):"
+          log "  hg19/GRCh37: chr15  45007636  45007918"
+          log "  hg38/GRCh38: chr15  44715438  44715720"
           die "unknown reference build for chr15 length=$CHR15_LEN"
           ;;
       esac
