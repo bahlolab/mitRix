@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# mitRix — estimate mtDNA damage from BAM/CRAM coverage ratios
+#
+# Output (TSV on stdout):
+#   sample  ratio  target  reference  target_mean_cov  ref_mean_cov  ratio_value
+#
+# Defaults assume the rCRS mitochondrial reference (NC_012920.1, 16569 bp).
+# The mtDNA contig name (chrM / MT / chrMT / NC_012920.1) is auto-detected
+# from the BAM/CRAM @SQ header. For mtDNA-CN, the nuclear build (hg19/hg38)
+# is auto-detected from the chr15 contig length; users can override with
+# --reference-bed.
+#
+# Default rCRS intervals (1-based, inclusive):
+#   ND1   : 3441-3504
+#   ND4   : 11333-11482
+#   ND5   : 12784-12969
+#   D-loop: 16024-16569 + 1-576  (full control region)
+#
+# B2M (nuclear reference for mtDNA-CN):
+#   hg19 (chr15 length 102,531,392): chr15:45,003,675-45,011,087
+#   hg38 (chr15 length 101,991,189): chr15:44,711,477-44,718,877
+
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="mitrix"
+
+usage() {
+  cat >&2 <<USAGE
+${PROG} v${VERSION} — mtDNA damage estimator (coverage ratios)
+
+USAGE
+  ${PROG} --bam FILE [--ratio NAME] [options]
+
+REQUIRED
+  --bam FILE                BAM or CRAM (indexed)
+
+RATIOS (pick one; default: ND4/ND1)
+  --ratio ND4/ND1           ND4 / ND1       (major-arc damage proxy)
+  --ratio ND5/ND1           ND5 / ND1       (major-arc damage proxy)
+  --ratio DLOOP/ND1         D-loop / ND1    (control-region coverage)
+  --ratio mtDNA-CN          ND1 / B2M       (mtDNA copy number proxy)
+  --ratio custom            requires --target AND --reference (or BEDs)
+
+CUSTOM REGIONS  (override either side of the chosen ratio)
+  --target START-END        target  interval on chrM (1-based closed)
+  --reference START-END     reference interval on chrM (1-based closed)
+  --target-bed FILE         target BED (multi-interval allowed)
+  --reference-bed FILE      reference BED (e.g. your own B2M coords)
+
+OTHER
+  --reference-fasta FA      reference FASTA (required for CRAM)
+  --sample NAME             sample name in output (default: BAM basename)
+  --threads N               threads for mosdepth (default: 4)
+  --outdir DIR              keep mosdepth output here (default: tmp dir)
+  --keep-tmp                do not delete temp dir
+  --no-header               suppress TSV header
+  --print-bed               print the resolved BED files to stderr
+  --version
+  -h, --help
+
+EXAMPLES
+  ${PROG} --bam sample.bam                                  # default: ND4/ND1
+  ${PROG} --bam sample.bam --ratio ND5/ND1
+  ${PROG} --bam sample.bam --ratio DLOOP/ND1 --sample S001
+  ${PROG} --bam sample.cram --reference-fasta hg38.fa --ratio mtDNA-CN
+  ${PROG} --bam sample.bam --ratio custom --target 8470-13447 --reference 3441-3504
+  ${PROG} --bam sample.bam --ratio mtDNA-CN --reference-bed my_B2M.bed
+USAGE
+}
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 2; }
+log() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# ----- defaults -----
+RATIO="ND4/ND1"
+BAM=""
+SAMPLE=""
+THREADS=4
+TARGET_RANGE=""
+REF_RANGE=""
+TARGET_BED=""
+REF_BED=""
+FASTA=""
+OUTDIR=""
+KEEP_TMP=0
+NO_HEADER=0
+PRINT_BED=0
+
+# rCRS default intervals (1-based, inclusive)
+ND1_RANGE="3441-3504"
+ND4_RANGE="11333-11482"
+ND5_RANGE="12784-12969"
+DLOOP_RANGES=("1-576" "16024-16569")   # sorted ascending
+
+# ----- parse args -----
+while (( "$#" )); do
+  case "$1" in
+    --bam)              BAM="$2"; shift 2;;
+    --ratio)            RATIO="$2"; shift 2;;
+    --target)           TARGET_RANGE="$2"; shift 2;;
+    --reference)        REF_RANGE="$2"; shift 2;;
+    --target-bed)       TARGET_BED="$2"; shift 2;;
+    --reference-bed)    REF_BED="$2"; shift 2;;
+    --reference-fasta)  FASTA="$2"; shift 2;;
+    --sample)           SAMPLE="$2"; shift 2;;
+    --threads)          THREADS="$2"; shift 2;;
+    --outdir)           OUTDIR="$2"; shift 2;;
+    --keep-tmp)         KEEP_TMP=1; shift;;
+    --no-header)        NO_HEADER=1; shift;;
+    --print-bed)        PRINT_BED=1; shift;;
+    --version)          echo "${PROG} ${VERSION}"; exit 0;;
+    -h|--help)          usage; exit 0;;
+    --)                 shift; break;;
+    -*)                 die "unknown option: $1";;
+    *)                  die "unexpected argument: $1";;
+  esac
+done
+
+[[ -n "$BAM" ]] || { usage; die "--bam is required"; }
+[[ -e "$BAM" ]] || die "BAM/CRAM not found: $BAM"
+
+# ----- dependency checks -----
+command -v samtools >/dev/null 2>&1 || die "samtools not found in PATH"
+command -v mosdepth >/dev/null 2>&1 || die "mosdepth not found in PATH (install: conda install -c bioconda mosdepth)"
+command -v awk >/dev/null 2>&1      || die "awk not found in PATH"
+command -v zcat >/dev/null 2>&1     || die "zcat not found in PATH"
+
+# index check (warn only — samtools/mosdepth will error if truly missing)
+case "$BAM" in
+  *.cram)
+    [[ -e "${BAM}.crai" || -e "${BAM%.cram}.crai" ]] || log "warning: no .crai index found beside $BAM"
+    ;;
+  *.bam)
+    [[ -e "${BAM}.bai" || -e "${BAM%.bam}.bai" || -e "${BAM}.csi" ]] \
+      || log "warning: no .bai/.csi index found beside $BAM"
+    ;;
+esac
+
+# CRAM needs FASTA
+if [[ "$BAM" == *.cram && -z "$FASTA" ]]; then
+  die "CRAM input requires --reference-fasta"
+fi
+
+SAMTOOLS_REF_OPT=()
+MOSDEPTH_FASTA_OPT=()
+if [[ -n "$FASTA" ]]; then
+  [[ -e "$FASTA" ]] || die "reference FASTA not found: $FASTA"
+  SAMTOOLS_REF_OPT=(--reference "$FASTA")
+  MOSDEPTH_FASTA_OPT=(--fasta "$FASTA")
+fi
+
+# sample name default
+if [[ -z "$SAMPLE" ]]; then
+  SAMPLE=$(basename "$BAM")
+  SAMPLE="${SAMPLE%.bam}"
+  SAMPLE="${SAMPLE%.cram}"
+fi
+
+# ----- read @SQ from BAM/CRAM header -----
+HDR=$(samtools view -H "${SAMTOOLS_REF_OPT[@]}" "$BAM") || die "failed to read header from $BAM"
+
+SQ=$(printf '%s\n' "$HDR" | awk 'BEGIN{OFS="\t"}
+  /^@SQ/ {
+    sn=""; ln="";
+    for (i=2;i<=NF;i++){
+      if ($i ~ /^SN:/) sn=substr($i,4);
+      else if ($i ~ /^LN:/) ln=substr($i,4);
+    }
+    if (sn != "") print sn, ln;
+  }')
+
+# detect mtDNA contig
+MT_CHR=""; MT_LEN=""
+for cand in chrM MT chrMT NC_012920.1 NC_012920; do
+  line=$(printf '%s\n' "$SQ" | awk -v c="$cand" '$1==c{print; exit}')
+  if [[ -n "$line" ]]; then
+    MT_CHR=$(printf '%s' "$line" | cut -f1)
+    MT_LEN=$(printf '%s' "$line" | cut -f2)
+    break
+  fi
+done
+if [[ -z "$MT_CHR" ]]; then
+  # fall back: any SQ with LN=16569
+  line=$(printf '%s\n' "$SQ" | awk '$2==16569{print; exit}')
+  if [[ -n "$line" ]]; then
+    MT_CHR=$(printf '%s' "$line" | cut -f1)
+    MT_LEN=$(printf '%s' "$line" | cut -f2)
+  fi
+fi
+[[ -n "$MT_CHR" ]] || die "no mtDNA contig (chrM/MT/chrMT/NC_012920.1 or LN=16569) found in BAM header"
+
+if [[ "$MT_LEN" != "16569" ]]; then
+  log "warning: mtDNA contig '$MT_CHR' has length $MT_LEN, not 16569 (rCRS). The built-in default coordinates assume rCRS — verify with --target/--reference or --target-bed/--reference-bed."
+else
+  log "mtDNA contig: $MT_CHR (rCRS, 16569 bp)"
+fi
+
+# detect chr15 (for B2M)
+CHR15=""; CHR15_LEN=""
+for cand in chr15 15; do
+  line=$(printf '%s\n' "$SQ" | awk -v c="$cand" '$1==c{print; exit}')
+  if [[ -n "$line" ]]; then
+    CHR15=$(printf '%s' "$line" | cut -f1)
+    CHR15_LEN=$(printf '%s' "$line" | cut -f2)
+    break
+  fi
+done
+
+detect_build() {
+  # chr15 length -> build label
+  case "$1" in
+    102531392) echo "hg19/GRCh37";;
+    101991189) echo "hg38/GRCh38";;
+    *)         echo "unknown";;
+  esac
+}
+
+# ----- assemble target / reference BED files -----
+TMP=$(mktemp -d -t mitrix.XXXXXX)
+cleanup() {
+  if (( KEEP_TMP )); then
+    log "kept temp dir: $TMP"
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -n "$OUTDIR" ]]; then
+  mkdir -p "$OUTDIR"
+  WORK="$OUTDIR"
+else
+  WORK="$TMP/work"; mkdir -p "$WORK"
+fi
+
+T_BED="$TMP/target.bed"
+R_BED="$TMP/reference.bed"
+: > "$T_BED"
+: > "$R_BED"
+
+# Append a 1-based closed range as a BED line (0-based half-open)
+append_range() {  # chr  start-end  outfile
+  local chr=$1 range=$2 out=$3 s e
+  if [[ ! "$range" =~ ^[0-9]+-[0-9]+$ ]]; then
+    die "bad range '$range' (expected START-END, 1-based inclusive)"
+  fi
+  s=${range%-*}; e=${range#*-}
+  (( s >= 1 && e >= s )) || die "bad range '$range' (start must be >= 1 and <= end)"
+  awk -v c="$chr" -v s="$s" -v e="$e" 'BEGIN{print c"\t"(s-1)"\t"e}' >> "$out"
+}
+
+# Sort a BED file in place (chrom, then numeric start)
+sort_bed_inplace() {
+  local f=$1
+  LC_ALL=C sort -k1,1 -k2,2n "$f" -o "$f"
+}
+
+# Resolve target / reference for a given ratio
+# `side`: "target" or "reference"
+# `out` : BED file to write
+resolve_side() {  # side default-chr default-ranges(space-sep)  out  userRange  userBed
+  local side=$1; shift
+  local def_chr=$1; shift
+  local def_ranges=$1; shift
+  local out=$1; shift
+  local userRange=$1; shift
+  local userBed=$1; shift
+
+  if [[ -n "$userBed" ]]; then
+    [[ -e "$userBed" ]] || die "$side BED not found: $userBed"
+    cp "$userBed" "$out"
+    return
+  fi
+  if [[ -n "$userRange" ]]; then
+    append_range "$def_chr" "$userRange" "$out"
+    return
+  fi
+  [[ -n "$def_ranges" ]] || die "no default $side region for ratio '$RATIO'"
+  local r
+  for r in $def_ranges; do
+    append_range "$def_chr" "$r" "$out"
+  done
+}
+
+case "$RATIO" in
+  mtDNA-CN)
+    # target = ND1 on chrM
+    resolve_side target    "$MT_CHR" "$ND1_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+    # reference = B2M on chr15
+    if [[ -n "$REF_BED" ]]; then
+      [[ -e "$REF_BED" ]] || die "reference BED not found: $REF_BED"
+      cp "$REF_BED" "$R_BED"
+    elif [[ -n "$REF_RANGE" ]]; then
+      [[ -n "$CHR15" ]] || die "--reference range given but chr15 not found in BAM header"
+      append_range "$CHR15" "$REF_RANGE" "$R_BED"
+    else
+      [[ -n "$CHR15" ]] || die "chr15 not found in BAM header; cannot auto-place B2M. Provide --reference-bed."
+      BUILD=$(detect_build "$CHR15_LEN")
+      case "$BUILD" in
+        hg38/GRCh38)
+          # B2M GRCh38: chr15:44,711,477-44,718,877 (1-based closed)
+          printf '%s\t%s\t%s\n' "$CHR15" 44711476 44718877 > "$R_BED"
+          ;;
+        hg19/GRCh37)
+          # B2M GRCh37: chr15:45,003,675-45,011,087
+          printf '%s\t%s\t%s\n' "$CHR15" 45003674 45011087 > "$R_BED"
+          ;;
+        *)
+          log "could not auto-detect nuclear build from chr15 length=$CHR15_LEN."
+          log "For B2M coordinates on your reference, supply --reference-bed FILE."
+          log "Reference BED examples (1-based closed coords):"
+          log "  hg19/GRCh37: chr15\t45003674\t45011087  (B2M)"
+          log "  hg38/GRCh38: chr15\t44711476\t44718877  (B2M)"
+          die "unknown reference build for chr15 length=$CHR15_LEN"
+          ;;
+      esac
+      log "nuclear build auto-detected: $BUILD (chr15 length=$CHR15_LEN); using B2M as reference"
+    fi
+    ;;
+  ND4/ND1)
+    resolve_side target    "$MT_CHR" "$ND4_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+    resolve_side reference "$MT_CHR" "$ND1_RANGE" "$R_BED" "$REF_RANGE"    "$REF_BED"
+    ;;
+  ND5/ND1)
+    resolve_side target    "$MT_CHR" "$ND5_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+    resolve_side reference "$MT_CHR" "$ND1_RANGE" "$R_BED" "$REF_RANGE"    "$REF_BED"
+    ;;
+  DLOOP/ND1|D-LOOP/ND1|D-loop/ND1|dloop/ND1)
+    RATIO="DLOOP/ND1"
+    resolve_side target    "$MT_CHR" "${DLOOP_RANGES[*]}" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+    resolve_side reference "$MT_CHR" "$ND1_RANGE"        "$R_BED" "$REF_RANGE"    "$REF_BED"
+    ;;
+  custom)
+    [[ -n "$TARGET_RANGE" || -n "$TARGET_BED" ]] || die "--ratio custom requires --target or --target-bed"
+    [[ -n "$REF_RANGE"    || -n "$REF_BED"    ]] || die "--ratio custom requires --reference or --reference-bed"
+    resolve_side target    "$MT_CHR" "" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+    resolve_side reference "$MT_CHR" "" "$R_BED" "$REF_RANGE"    "$REF_BED"
+    ;;
+  *)
+    die "unknown --ratio: '$RATIO' (allowed: mtDNA-CN, ND4/ND1, ND5/ND1, DLOOP/ND1, custom)"
+    ;;
+esac
+
+sort_bed_inplace "$T_BED"
+sort_bed_inplace "$R_BED"
+
+[[ -s "$T_BED" ]] || die "target BED is empty"
+[[ -s "$R_BED" ]] || die "reference BED is empty"
+
+# Verify all BED chromosomes are present in the BAM header
+verify_bed_chroms() {
+  local f=$1 label=$2
+  local missing
+  missing=$(awk 'NR==FNR{a[$1]=1; next} !($1 in a){print $1}' \
+             <(printf '%s\n' "$SQ" | cut -f1) "$f" | sort -u || true)
+  if [[ -n "$missing" ]]; then
+    die "$label BED contains chrom(s) not present in BAM header: $(echo "$missing" | tr '\n' ' ')"
+  fi
+}
+verify_bed_chroms "$T_BED" target
+verify_bed_chroms "$R_BED" reference
+
+if (( PRINT_BED )); then
+  log "--- target BED ($T_BED) ---"
+  cat "$T_BED" >&2
+  log "--- reference BED ($R_BED) ---"
+  cat "$R_BED" >&2
+fi
+
+# ----- run mosdepth -----
+run_mosdepth() {  # prefix bed
+  local prefix=$1 bed=$2
+  # -n: no per-base; --by BED: per-region mean depth
+  mosdepth -n -t "$THREADS" --by "$bed" "${MOSDEPTH_FASTA_OPT[@]}" "$prefix" "$BAM" \
+    || die "mosdepth failed (bed=$bed prefix=$prefix)"
+}
+
+run_mosdepth "$WORK/target"    "$T_BED"
+run_mosdepth "$WORK/reference" "$R_BED"
+
+# ----- compute length-weighted mean coverage across all intervals -----
+weighted_mean() {  # path/to/regions.bed.gz
+  local f=$1
+  [[ -e "$f" ]] || die "mosdepth output missing: $f"
+  zcat "$f" | awk 'BEGIN{tot=0; len=0}
+    { l = $3 - $2; if (l<=0) next; tot += l * $4; len += l }
+    END { if (len > 0) printf "%.6f", tot/len; else print "NA" }'
+}
+
+T_MEAN=$(weighted_mean "$WORK/target.regions.bed.gz")
+R_MEAN=$(weighted_mean "$WORK/reference.regions.bed.gz")
+
+RATIO_VAL=$(awk -v a="$T_MEAN" -v b="$R_MEAN" 'BEGIN{
+  if (a == "NA" || b == "NA") { print "NA"; exit }
+  if (b+0 == 0)               { print "NA"; exit }
+  printf "%.6f", (a+0)/(b+0)
+}')
+
+# ----- format region strings for output -----
+fmt_regions() {  # bed file
+  awk 'BEGIN{prev=""}
+       {
+         s=$2+1; e=$3;
+         if ($1 != prev) {
+           if (prev != "") printf ";"
+           printf "%s:%d-%d", $1, s, e
+           prev=$1
+         } else {
+           printf ",%d-%d", s, e
+         }
+       }
+       END { printf "\n" }' "$1"
+}
+
+T_STR=$(fmt_regions "$T_BED")
+R_STR=$(fmt_regions "$R_BED")
+
+# ----- emit TSV -----
+if (( ! NO_HEADER )); then
+  printf "sample\tratio\ttarget\treference\ttarget_mean_cov\tref_mean_cov\tratio_value\n"
+fi
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+  "$SAMPLE" "$RATIO" "$T_STR" "$R_STR" "$T_MEAN" "$R_MEAN" "$RATIO_VAL"
