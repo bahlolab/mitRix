@@ -1,8 +1,8 @@
 # mitRix
 
-A small shell tool that estimates mtDNA damage / copy-number proxies as a
+A bioinformatics tool that estimates mtDNA damage / copy-number proxies as a
 **mean-coverage ratio** from a BAM/CRAM. Built to be the NGS analog of a
-wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
+wet-lab Ct ratio so the two read-outs are directly comparable.
 
 ```
 mitrix --bam sample.bam --ratio ND4/ND1
@@ -12,13 +12,11 @@ mitrix --bam sample.bam --ratio ND4/ND1
 
 ## Versions
 
-- **Basic (this directory).** Wet-lab Ct mimic. Defaults to the published
-  Thermo Fisher / Picard 4-plex TaqMan amplicon coordinates. Different labs
-  can plug in their own targets via `--target` / `--target-bed` (and the
-  reference counterparts).
-- **Plus (planned).** Same ratios on the same regions, but with methodology
-  improvements layered on top — GC-bias correction, NUMT/MAPQ filtering,
-  duplicate-aware depth, bootstrap CIs, etc. Not implemented yet.
+- **Basic.** Wet-lab Ct mimic. Defaults to the published Thermo Fisher /
+  Picard 4-plex TaqMan amplicon coordinates. Different labs can plug in
+  their own targets via `--target` / `--target-bed` (and the reference counterparts).
+- **Plus (TO DO).** methodology improvements to capture mtDNA major arc damage
+  and replication.
 
 ## What it does
 
