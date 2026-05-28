@@ -355,13 +355,27 @@ weighted_mean() {  # regions.bed.gz
     END { if (len > 0) printf "%.2f", tot/len; else print "NA" }'
 }
 
-# Extract per-base depths for BED intervals from a mosdepth per-base file
+# Extract per-base depths for BED intervals from a mosdepth per-base file.
+# mosdepth per-base uses RLE: one record may cover many positions with the same
+# depth (e.g. "chrM 16535 16553 4944" = 18 positions, all depth 4944).
+# We expand to one output value per overlapping position so that calc_mean gets
+# a position-weighted mean and calc_median gets a position-level median.
 extract_from_perbase() {  # bed perbase_gz
   local bed=$1 perbase=$2
   [[ -e "$perbase" ]] || die "per-base output missing: $perbase"
   zcat "$perbase" | awk -v bedfile="$bed" '
     BEGIN { while ((getline < bedfile) > 0) { c[++n]=$1; s[n]=$2+0; e[n]=$3+0 } }
-    { for (i=1;i<=n;i++) if ($1==c[i] && $2+0>=s[i] && $3+0<=e[i]) { print $4+0; break } }
+    {
+      for (i=1;i<=n;i++) {
+        if ($1==c[i]) {
+          os = ($2+0 > s[i]) ? $2+0 : s[i]   # overlap start
+          oe = ($3+0 < e[i]) ? $3+0 : e[i]   # overlap end
+          if (oe > os) {
+            for (p=os; p<oe; p++) print $4+0  # one value per overlapping bp
+          }
+        }
+      }
+    }
   '
 }
 
@@ -412,6 +426,16 @@ mosdepth -t "$THREADS" -F "$FLAG" -c "$MT_CHR" "${MOSDEPTH_FASTA_OPT[@]}" "$CHRM
 CHRM_PERBASE_GZ="${CHRM_PREFIX}.per-base.bed.gz"
 [[ -e "$CHRM_PERBASE_GZ" ]] || die "chrM per-base output not found: $CHRM_PERBASE_GZ"
 rm -f "${CHRM_PREFIX}.mosdepth.summary.txt" "${CHRM_PREFIX}.mosdepth.global.dist.txt"
+
+# Expand mosdepth RLE to one line per base position (makes the saved file
+# easier to inspect and use directly in R or other tools).
+# e.g. "chrM 3441 3504 5000" (63 positions) → 63 individual lines.
+log "expanding chrM per-base RLE → one line per position"
+_tmp="${TMP}/${SAMPLE}.chrM.per-base.tmp.gz"
+zcat "$CHRM_PERBASE_GZ" \
+  | awk '{ for (p=$2; p<$3; p++) print $1"\t"p"\t"(p+1)"\t"$4 }' \
+  | gzip -c > "$_tmp" \
+  && mv "$_tmp" "$CHRM_PERBASE_GZ"
 
 # ----- define ratios to run -----
 if (( ALL )); then
