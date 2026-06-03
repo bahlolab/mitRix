@@ -55,7 +55,7 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
 
 ```bash
 # Install mosdepth + bwa via conda (recommended)
-conda create -n mitrix -c bioconda mosdepth bwa
+conda create -n mitrix -c bioconda mosdepth
 conda activate mitrix
 
 # Make executable (once only)
@@ -68,10 +68,10 @@ mv mitRix ~/.local/bin/
 
 **HPC (module system):**
 ```bash
-module load samtools/1.23
-module load bwa
 module load miniconda3/
 conda activate mitrix
+module load samtools
+module load bwa
 ```
 
 **One-time setup for `DLOOP/ND1`** — build the chrMC circularised reference:
