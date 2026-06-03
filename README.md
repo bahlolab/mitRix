@@ -17,9 +17,8 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
   can plug in their own targets via `--target` / `--target-bed` (and the
   reference counterparts).
 - **Plus (planned).** Dedicated methodology for three damage axes — major-arc
-  large deletion burden, 7S DNA / replication activity, and mtDNA copy number
-  — with GC-bias correction, NUMT/MAPQ filtering, duplicate-aware depth,
-  bootstrap CIs, etc. Not implemented yet.
+  large deletion burden, 7S DNA / replication activity, and mtDNA copy number.
+  Not implemented yet.
 
 ## What it does
 
