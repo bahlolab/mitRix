@@ -28,6 +28,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VERSION="0.1.0"
 PROG="mitRix"
 
@@ -75,6 +76,9 @@ OTHER
                             default 1796 (unmapped + not-primary + QC-fail + duplicate)
                             2820  = drop supplementary instead of duplicates
                             3844  = drop both duplicates and supplementary
+  --rotate-perbase          save chrMC per-base as {outdir}/{sample}.chrMC.per-base.bed.gz
+                            for visual comparison with the original chrM per-base file
+                            (chrMC coords: 1-16569 same as chrM; 16570-17269 = appended copy)
   --no-header               suppress TSV header
   --print-bed               print the resolved BED files to stderr
   --version
@@ -110,6 +114,7 @@ PRINT_BED=0
 ALL=0
 STAT="mean"
 FLAG=1796          # mosdepth -F: exclude reads with any of these bits set
+ROTATE_PERBASE=0   # save chrMC per-base to outdir for comparison
 
 # rCRS default intervals (1-based, inclusive) — Thermo/Picard 4-plex amplicons
 ND1_RANGE="3441-3504"
@@ -137,6 +142,7 @@ while (( "$#" )); do
     --mean)             STAT="mean"; shift;;
     --median)           STAT="median"; shift;;
     --flag)             FLAG="$2"; shift 2;;
+    --rotate-perbase)   ROTATE_PERBASE=1; shift;;
     --version)          echo "${PROG} ${VERSION}"; exit 0;;
     -h|--help)          usage; exit 0;;
     --)                 shift; break;;
@@ -157,11 +163,23 @@ fi
 
 [[ "$FLAG" =~ ^[0-9]+$ ]] || die "--flag must be a non-negative integer: $FLAG"
 
+# DLOOP/ND1 always uses chrMC re-alignment — check BWA + reference early
+CHRMC_REF="$SCRIPT_DIR/refs/chrMC_rCRS.fa"
+_will_use_dloop=0
+case "$RATIO" in DLOOP/ND1|D-LOOP/ND1|D-loop/ND1|dloop/ND1) _will_use_dloop=1;; esac
+(( ALL )) && _will_use_dloop=1
+
 # ----- dependency checks -----
 command -v samtools >/dev/null 2>&1 || die "samtools not found in PATH"
 command -v mosdepth >/dev/null 2>&1 || die "mosdepth not found in PATH (install: conda install -c bioconda mosdepth)"
-command -v awk >/dev/null 2>&1      || die "awk not found in PATH"
-command -v zcat >/dev/null 2>&1     || die "zcat not found in PATH"
+command -v awk      >/dev/null 2>&1 || die "awk not found in PATH"
+command -v zcat     >/dev/null 2>&1 || die "zcat not found in PATH"
+if (( _will_use_dloop )); then
+  command -v bwa >/dev/null 2>&1 \
+    || die "bwa not found in PATH (required for DLOOP/ND1; module load bwa)"
+  [[ -f "$CHRMC_REF" ]] \
+    || die "chrMC reference not found: $CHRMC_REF\nRun: bash refs/make_chrMC.sh"
+fi
 
 # index check (warn only — samtools/mosdepth will error if truly missing)
 case "$BAM" in
@@ -435,7 +453,8 @@ _tmp="${TMP}/${SAMPLE}.chrM.per-base.tmp.gz"
 zcat "$CHRM_PERBASE_GZ" \
   | awk '{ for (p=$2; p<$3; p++) print $1"\t"p"\t"(p+1)"\t"$4 }' \
   | gzip -c > "$_tmp" \
-  && mv "$_tmp" "$CHRM_PERBASE_GZ"
+  || die "RLE expansion failed (is /tmp full? try --keep-tmp and check $TMP)"
+mv "$_tmp" "$CHRM_PERBASE_GZ"
 
 # ----- define ratios to run -----
 if (( ALL )); then
@@ -445,6 +464,9 @@ else
 fi
 
 _FIRST_ROW=1
+_ROTATED_BAM=""      # chrMC BAM, built once on first DLOOP/ND1 run, reused by --all
+_CHRMC_PERBASE_GZ="" # chrMC per-base, cached alongside _ROTATED_BAM
+_CORRECTED_GZ=""     # corrected chrM per-base (16569 bp, modulo-summed); used for ND1 ref
 
 # ----- per-ratio loop -----
 for RATIO in "${RATIOS[@]}"; do
@@ -540,14 +562,182 @@ for RATIO in "${RATIOS[@]}"; do
     cat "$R_BED" >&2
   fi
 
-  # target is always on chrM — extract from the single per-base run
-  if [[ "$STAT" == "median" ]]; then
-    T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_median)
+  # ── target coverage ──────────────────────────────────────────────────────
+  if [[ "$RATIO" == "DLOOP/ND1" ]]; then
+    # D-loop always uses chrMC re-alignment (MitoHPC append approach).
+    # chrMC = rCRS (16569 bp) + first 700 bp appended → 17269 bp.
+    # 700 bp ≈ 2× mean insert size, capturing >99.9% of seam-crossing pairs.
+    # Reads crossing the linear seam can now align contiguously.
+    #
+    # Build BWA index once (a few seconds, only if missing)
+    if [[ ! -f "${CHRMC_REF}.bwt" ]]; then
+      log "building BWA index for chrMC (one-time)..."
+      bwa index "$CHRMC_REF" 2>/dev/null || die "bwa index failed for $CHRMC_REF"
+    fi
+
+    # Re-align chrM reads to chrMC (cached: built once, reused if --all).
+    # Paired-end mode (R1+R2 separate files → bwa mem without -p) preserves
+    # mate-pair information, eliminating the ~1.16× coverage inflation seen
+    # with single-end re-alignment.
+    # Singletons (reads whose mate is not on chrM) are aligned separately
+    # in single-end mode so no chrM reads are lost.
+    if [[ -z "$_ROTATED_BAM" ]]; then
+      _ROTATED_BAM="$TMP/${SAMPLE}.chrMC.bam"
+      log "re-aligning chrM reads to chrMC (paired-end mode)..."
+      # Extraction: exclude supplementary (already partial alignments) +
+      # anything already excluded by FLAG (dup, secondary, QC-fail, unmapped).
+      _EXTRACT_FLAG=$(( FLAG | 2048 ))
+      # Split chrM reads into R1, R2, and singletons (one mate off-chrM).
+      # Using separate R1/R2 files avoids --interleave (added in samtools 1.21+).
+      _FQ_R1="$TMP/${SAMPLE}.R1.fq.gz"
+      _FQ_R2="$TMP/${SAMPLE}.R2.fq.gz"
+      _FQ_SE="$TMP/${SAMPLE}.se.fq.gz"
+      # Step 1: extract + collate chrM reads to a temp BAM (avoids process
+      # substitution inside a pipeline, which fails on many HPC environments).
+      _COLLATED_BAM="$TMP/${SAMPLE}.collated.bam"
+      samtools view -b -F "$_EXTRACT_FLAG" "${SAMTOOLS_REF_OPT[@]}" "$BAM" "$MT_CHR" \
+          2> >(grep -v "^\[W::" >&2) \
+        | samtools collate -O -u -@ "$THREADS" - "$TMP/collate" 2>/dev/null \
+        > "$_COLLATED_BAM" \
+        || die "failed to collate chrM reads"
+      # Step 2: split into R1, R2, and singletons (-s = paired read without its mate).
+      samtools fastq -1 "$_FQ_R1" -2 "$_FQ_R2" -s "$_FQ_SE" -0 /dev/null \
+                     -@ "$THREADS" "$_COLLATED_BAM" 2>/dev/null \
+        || die "failed to convert chrM reads to FASTQ"
+      rm -f "$_COLLATED_BAM"
+      # Align R1+R2 as paired-end, then singletons in single-end mode.
+      # Only one SAM header must reach samtools sort, so strip @-lines from
+      # the singleton bwa call when PE reads are also present.
+      {
+        if [[ -s "$_FQ_R1" ]]; then
+          bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                  <(gunzip -c "$_FQ_R1") <(gunzip -c "$_FQ_R2") 2>/dev/null
+          if [[ -s "$_FQ_SE" ]]; then
+            bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                    <(gunzip -c "$_FQ_SE") 2>/dev/null | grep -v '^@'
+          fi
+        elif [[ -s "$_FQ_SE" ]]; then
+          bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                  <(gunzip -c "$_FQ_SE") 2>/dev/null
+        fi
+      } | samtools sort -T "$TMP/sort" -@ "$THREADS" -o "$_ROTATED_BAM" \
+        || die "failed to create chrMC BAM"
+      rm -f "$_FQ_R1" "$_FQ_R2" "$_FQ_SE"
+      samtools index "$_ROTATED_BAM" || die "failed to index chrMC BAM"
+    fi
+
+    # chrMC per-base coverage (cached alongside _ROTATED_BAM)
+    if [[ -z "$_CHRMC_PERBASE_GZ" ]]; then
+      if (( ROTATE_PERBASE )); then
+        _CHRMC_PREFIX="${CHRM_OUT_DIR}/${SAMPLE}.chrMC"
+        log "computing chrMC per-base coverage → ${_CHRMC_PREFIX}.per-base.bed.gz"
+      else
+        _CHRMC_PREFIX="$TMP/${SAMPLE}.chrMC"
+        log "computing chrMC per-base coverage (temporary)..."
+      fi
+      _CHRMC_MDEPTH_FLAG=$(( FLAG | 2048 ))
+      mosdepth -t "$THREADS" -F "$_CHRMC_MDEPTH_FLAG" -c "chrMC" \
+        "$_CHRMC_PREFIX" "$_ROTATED_BAM" 2>/dev/null \
+        || die "mosdepth failed for chrMC per-base"
+      rm -f "${_CHRMC_PREFIX}.mosdepth.summary.txt" \
+             "${_CHRMC_PREFIX}.mosdepth.global.dist.txt"
+      # Expand RLE → one line per base position
+      _tmp="$TMP/${SAMPLE}.chrMC.per-base.tmp.gz"
+      zcat "${_CHRMC_PREFIX}.per-base.bed.gz" \
+        | awk '{ for (p=$2; p<$3; p++) print $1"\t"p"\t"(p+1)"\t"$4 }' \
+        | gzip -c > "$_tmp" \
+        || die "RLE expansion of chrMC per-base failed (is /tmp full?)"
+      mv "$_tmp" "${_CHRMC_PREFIX}.per-base.bed.gz"
+      _CHRMC_PERBASE_GZ="${_CHRMC_PREFIX}.per-base.bed.gz"
+
+      # Always build the corrected chrM per-base (16569 bp, modulo-summed).
+      # Positions in the appended zone (1 to EXT bp) receive depth from both
+      # chrMC copies (arm2a + arm2b); positions beyond EXT come from chrMC
+      # directly. Used for ND1 reference in DLOOP/ND1 (ND1 at 3441-3504 is
+      # well outside the appended zone so it is unaffected by the summing).
+      # Saved to outdir if --rotate-perbase, otherwise kept in TMP.
+      if (( ROTATE_PERBASE )); then
+        _CORRECTED_GZ="${CHRM_OUT_DIR}/${SAMPLE}.chrM.corrected.per-base.bed.gz"
+      else
+        _CORRECTED_GZ="$TMP/${SAMPLE}.chrM.corrected.per-base.bed.gz"
+      fi
+      log "building corrected chrM per-base (chrMC → 16569 bp)..."
+      zcat "$_CHRMC_PERBASE_GZ" \
+        | awk -v mt_chr="$MT_CHR" -v mt_len=16569 '
+            {
+              pos = $2 + 1
+              dep = $4 + 0
+              if (pos <= mt_len) { d[pos] += dep }
+              else               { d[pos - mt_len] += dep }
+            }
+            END {
+              for (i = 1; i <= mt_len; i++)
+                print mt_chr "\t" (i-1) "\t" i "\t" (i in d ? d[i] : 0)
+            }' \
+        | gzip -c > "$_CORRECTED_GZ" \
+        || die "failed to build corrected chrM per-base"
+    fi
+
+    # Three-region extraction from chrMC per-base:
+    #   arm1  chrMC:16536-16569 — single copy, unambiguous
+    #   arm2a chrMC:1-34        — reads BWA placed at the start copy
+    #   arm2b chrMC:16570-16603 — reads BWA placed at the seam copy
+    # True depth at chrM:1-34[i] = arm2a[i] + arm2b[i]
+    # Mean  = (arm1_mean + arm2a_mean + arm2b_mean) / 2
+    # Median = median of 68 values: 34 arm1 depths + 34 pairwise sums
+    if [[ -n "$TARGET_RANGE" || -n "$TARGET_BED" ]]; then
+      log "warning: custom --target with DLOOP/ND1 — falling back to chrM per-base" \
+          "(chrMC correction applies to the default amplicon only)"
+      if [[ "$STAT" == "median" ]]; then
+        T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_median)
+      else
+        T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_mean)
+      fi
+    else
+      _BED_ARM1="$TMP/dloop_arm1.bed"
+      _BED_ARM2A="$TMP/dloop_arm2a.bed"
+      _BED_ARM2B="$TMP/dloop_arm2b.bed"
+      printf 'chrMC\t%d\t%d\n' 16535 16569 > "$_BED_ARM1"
+      printf 'chrMC\t%d\t%d\n' 0     34    > "$_BED_ARM2A"
+      printf 'chrMC\t%d\t%d\n' 16569 16603 > "$_BED_ARM2B"
+
+      if [[ "$STAT" == "median" ]]; then
+        T_MEAN=$(
+          { extract_from_perbase "$_BED_ARM1" "$_CHRMC_PERBASE_GZ"
+            paste \
+              <(extract_from_perbase "$_BED_ARM2A" "$_CHRMC_PERBASE_GZ") \
+              <(extract_from_perbase "$_BED_ARM2B" "$_CHRMC_PERBASE_GZ") \
+              | awk '{print $1+$2}'
+          } | calc_median
+        )
+      else
+        _arm1=$(extract_from_perbase  "$_BED_ARM1"  "$_CHRMC_PERBASE_GZ" | calc_mean)
+        _arm2a=$(extract_from_perbase "$_BED_ARM2A" "$_CHRMC_PERBASE_GZ" | calc_mean)
+        _arm2b=$(extract_from_perbase "$_BED_ARM2B" "$_CHRMC_PERBASE_GZ" | calc_mean)
+        T_MEAN=$(awk -v a="$_arm1" -v b="$_arm2a" -v c="$_arm2b" \
+          'BEGIN{ if(a=="NA"||b=="NA"||c=="NA"){print "NA"; exit}
+                  printf "%.2f",(a+b+c)/2 }')
+      fi
+      log "D-loop coverage (chrMC 3-region): $T_MEAN"
+    fi
   else
-    T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_mean)
+    # All other ratios: extract directly from chrM per-base
+    if [[ "$STAT" == "median" ]]; then
+      T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_median)
+    else
+      T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_mean)
+    fi
   fi
 
-  # reference: on chrM for ND4/ND1, ND5/ND1, DLOOP/ND1; on chr15 for mtDNA-CN
+  # ── reference coverage ───────────────────────────────────────────────────────
+  # DLOOP/ND1: use the corrected chrM per-base for ND1 so that both numerator
+  # and denominator come from the same re-aligned chrMC BAM.
+  # All other ratios: use the original chrM per-base.
+  _REF_PERBASE="$CHRM_PERBASE_GZ"
+  if [[ "$RATIO" == "DLOOP/ND1" && -n "$_CORRECTED_GZ" ]]; then
+    _REF_PERBASE="$_CORRECTED_GZ"
+  fi
+
   if [[ "$RATIO" == "mtDNA-CN" ]]; then
     # mosdepth --use-median reports per-region median in col 4 (same output format as mean)
     if [[ "$STAT" == "median" ]]; then
@@ -558,9 +748,9 @@ for RATIO in "${RATIOS[@]}"; do
     R_MEAN=$(weighted_mean "$WORK/${_slug}_reference.regions.bed.gz")
   else
     if [[ "$STAT" == "median" ]]; then
-      R_MEAN=$(extract_from_perbase "$R_BED" "$CHRM_PERBASE_GZ" | calc_median)
+      R_MEAN=$(extract_from_perbase "$R_BED" "$_REF_PERBASE" | calc_median)
     else
-      R_MEAN=$(extract_from_perbase "$R_BED" "$CHRM_PERBASE_GZ" | calc_mean)
+      R_MEAN=$(extract_from_perbase "$R_BED" "$_REF_PERBASE" | calc_mean)
     fi
   fi
 
