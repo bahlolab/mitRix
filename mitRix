@@ -564,10 +564,16 @@ for RATIO in "${RATIOS[@]}"; do
 
   # ── target coverage ──────────────────────────────────────────────────────
   if [[ "$RATIO" == "DLOOP/ND1" ]]; then
-    # D-loop always uses chrMC re-alignment (MitoHPC append approach).
+    # D-loop uses chrMC re-alignment to recover reads soft-clipped at the
+    # linear reference seam (chrM:16569→1).
+    #
     # chrMC = rCRS (16569 bp) + first 700 bp appended → 17269 bp.
     # 700 bp ≈ 2× mean insert size, capturing >99.9% of seam-crossing pairs.
-    # Reads crossing the linear seam can now align contiguously.
+    # After re-alignment, a corrected chrM per-base file is built by folding
+    # chrMC back to 16569 bp (modulo-sum): positions 1–700 receive depth from
+    # both the start copy and the seam copy summed; positions 701–16569 are
+    # unchanged. D-loop (chrM:1-34 + chrM:16536-16569) and ND1 (chrM:3441-3504)
+    # are then extracted from this corrected file the same way as any other ratio.
     #
     # Build BWA index once (a few seconds, only if missing)
     if [[ ! -f "${CHRMC_REF}.bwt" ]]; then
@@ -678,48 +684,24 @@ for RATIO in "${RATIOS[@]}"; do
         || die "failed to build corrected chrM per-base"
     fi
 
-    # Three-region extraction from chrMC per-base:
-    #   arm1  chrMC:16536-16569 — single copy, unambiguous
-    #   arm2a chrMC:1-34        — reads BWA placed at the start copy
-    #   arm2b chrMC:16570-16603 — reads BWA placed at the seam copy
-    # True depth at chrM:1-34[i] = arm2a[i] + arm2b[i]
-    # Mean  = (arm1_mean + arm2a_mean + arm2b_mean) / 2
-    # Median = median of 68 values: 34 arm1 depths + 34 pairwise sums
+    # Extract D-loop depth from the corrected chrM per-base.
+    # The corrected file folds chrMC back to 16569 bp: positions 1-EXT have
+    # arm2a + arm2b already summed, so extracting chrM:1-34 and chrM:16536-16569
+    # directly gives the correct depth — identical to the 3-region formula but
+    # without the extra complexity.
+    # Custom --target falls back to the original chrM per-base (no correction).
+    _DLOOP_PERBASE="$_CORRECTED_GZ"
     if [[ -n "$TARGET_RANGE" || -n "$TARGET_BED" ]]; then
-      log "warning: custom --target with DLOOP/ND1 — falling back to chrM per-base" \
+      log "warning: custom --target with DLOOP/ND1 — using original chrM per-base" \
           "(chrMC correction applies to the default amplicon only)"
-      if [[ "$STAT" == "median" ]]; then
-        T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_median)
-      else
-        T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_mean)
-      fi
-    else
-      _BED_ARM1="$TMP/dloop_arm1.bed"
-      _BED_ARM2A="$TMP/dloop_arm2a.bed"
-      _BED_ARM2B="$TMP/dloop_arm2b.bed"
-      printf 'chrMC\t%d\t%d\n' 16535 16569 > "$_BED_ARM1"
-      printf 'chrMC\t%d\t%d\n' 0     34    > "$_BED_ARM2A"
-      printf 'chrMC\t%d\t%d\n' 16569 16603 > "$_BED_ARM2B"
-
-      if [[ "$STAT" == "median" ]]; then
-        T_MEAN=$(
-          { extract_from_perbase "$_BED_ARM1" "$_CHRMC_PERBASE_GZ"
-            paste \
-              <(extract_from_perbase "$_BED_ARM2A" "$_CHRMC_PERBASE_GZ") \
-              <(extract_from_perbase "$_BED_ARM2B" "$_CHRMC_PERBASE_GZ") \
-              | awk '{print $1+$2}'
-          } | calc_median
-        )
-      else
-        _arm1=$(extract_from_perbase  "$_BED_ARM1"  "$_CHRMC_PERBASE_GZ" | calc_mean)
-        _arm2a=$(extract_from_perbase "$_BED_ARM2A" "$_CHRMC_PERBASE_GZ" | calc_mean)
-        _arm2b=$(extract_from_perbase "$_BED_ARM2B" "$_CHRMC_PERBASE_GZ" | calc_mean)
-        T_MEAN=$(awk -v a="$_arm1" -v b="$_arm2a" -v c="$_arm2b" \
-          'BEGIN{ if(a=="NA"||b=="NA"||c=="NA"){print "NA"; exit}
-                  printf "%.2f",(a+b+c)/2 }')
-      fi
-      log "D-loop coverage (chrMC 3-region): $T_MEAN"
+      _DLOOP_PERBASE="$CHRM_PERBASE_GZ"
     fi
+    if [[ "$STAT" == "median" ]]; then
+      T_MEAN=$(extract_from_perbase "$T_BED" "$_DLOOP_PERBASE" | calc_median)
+    else
+      T_MEAN=$(extract_from_perbase "$T_BED" "$_DLOOP_PERBASE" | calc_mean)
+    fi
+    log "D-loop coverage (corrected per-base): $T_MEAN"
   else
     # All other ratios: extract directly from chrM per-base
     if [[ "$STAT" == "median" ]]; then
@@ -730,8 +712,8 @@ for RATIO in "${RATIOS[@]}"; do
   fi
 
   # ── reference coverage ───────────────────────────────────────────────────────
-  # DLOOP/ND1: use the corrected chrM per-base for ND1 so that both numerator
-  # and denominator come from the same re-aligned chrMC BAM.
+  # DLOOP/ND1: use the corrected chrM per-base so both target and reference
+  # come from the same re-aligned chrMC BAM (consistent denominator).
   # All other ratios: use the original chrM per-base.
   _REF_PERBASE="$CHRM_PERBASE_GZ"
   if [[ "$RATIO" == "DLOOP/ND1" && -n "$_CORRECTED_GZ" ]]; then
