@@ -221,17 +221,17 @@ ends of the amplicon and inflating the DLOOP/ND1 ratio by ~1.16×.
 (**chrMC**) built by appending the first 700 bp of rCRS to the end of the
 genome (16,569 + 700 = 17,269 bp). The 700 bp extension is ≈ 2× the typical
 WGS mean insert size, ensuring >99.9% of seam-crossing read pairs are fully
-contained within the reference. After re-alignment with BWA in paired-end mode:
+contained within the reference. 
+After re-alignment, a **corrected chrM per-base file** is built by folding
+chrMC back to 16,569 bp (modulo-sum): positions in the appended zone (1–700)
+receive depth from both the start copy and the seam copy summed together;
+positions 701–16,569 are unchanged.
 
-- **arm1** (`chrMC:16536-16569`) — single unambiguous copy of the left arm
-- **arm2a** (`chrMC:1-34`) — reads BWA placed in the start copy of the right arm
-- **arm2b** (`chrMC:16570-16603`) — reads BWA placed in the appended seam copy
-
-D-loop depth = `(arm1_mean + arm2a_mean + arm2b_mean) / 2`
-
-ND1 is extracted from a corrected per-base file that folds the chrMC appended
-region back to chrM coordinates (modulo-sum). ND1 is at 3441–3504, well outside
-the appended zone (1–700 bp), so it is unaffected.
+D-loop depth and ND1 depth are both extracted directly from this corrected
+file — the same way as any other ratio. At positions 1–34 (arm2), the summing
+already accounts for reads that previously soft-clipped at the seam; at
+positions 16,536–16,569 (arm1) and 3,441–3,504 (ND1) the corrected file is
+identical to the original chrM per-base.
 
 Use `--rotate-perbase` to save the chrMC and corrected per-base files for QC
 inspection, then plot with `Rscript plot_dloop.R <outdir> <sample>`.
