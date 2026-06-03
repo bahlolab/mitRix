@@ -23,30 +23,40 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
 
 ## What it does
 
-1. Reads the BAM/CRAM `@SQ` header to detect:
-   - the mtDNA contig name (`chrM` / `MT` / `chrMT` / `NC_012920.1`)
-   - the nuclear build (hg19 vs hg38) from the `chr15` length, so the right
-     B2M amplicon coordinates are used for `mtDNA-CN` without intervention
-2. Runs `mosdepth` once for all of chrM (per-base) →
-   `{sample}.chrM.per-base.bed.gz` (kept as output)
-3. Extracts the target and reference intervals from that per-base file and
-   computes mean (length-weighted) or median per-base depth for each side
-4. For `mtDNA-CN`, B2M coverage on chr15 is computed in a separate
-   `mosdepth --by` call (mean) or with `--use-median` (median) — uses the
-   BAM index to read only the B2M region
-5. Emits one TSV line per ratio on stdout
+1. **Header scan** — reads the BAM/CRAM `@SQ` header to auto-detect:
+   - mtDNA contig name (`chrM` / `MT` / `chrMT` / `NC_012920.1`)
+   - nuclear build (hg19 vs hg38) from `chr15` length, so the correct
+     B2M coordinates are used for `mtDNA-CN` without manual input
+2. **chrM per-base coverage** — runs `mosdepth -c <mt_contig>` once,
+   producing `{sample}.chrM.per-base.bed.gz` (saved to `--outdir`).
+   This single run covers all chrM-based ratios (ND4/ND1, ND5/ND1,
+   DLOOP/ND1) regardless of whether `--all` or a single `--ratio` is used.
+3. **Region extraction** — for each ratio, the target and reference
+   intervals are resolved from built-in defaults (or user overrides via
+   `--target` / `--reference` / `--target-bed` / `--reference-bed`) and
+   extracted from the chrM per-base file.
+4. **Coverage statistic** — mean (length-weighted, default) or median
+   (`--median`) per-base depth is computed for each side. Read filtering
+   is controlled by `--flag` (default 1796: exclude unmapped, non-primary,
+   QC-failed, and duplicate reads).
+5. **B2M (mtDNA-CN only)** — chr15 coverage for B2M is computed in a
+   separate `mosdepth --by` call scoped to the B2M region only (uses the
+   BAM index; does not scan all of chr15). Mean uses `-n`, median uses
+   `--use-median`.
+6. **Output** — one TSV line per ratio written to stdout.
 
 ## Install / dependencies
 
 `mitRix` is a bash script. It needs:
 
-- `samtools` (>= 1.10) — reads the BAM/CRAM header
+- `samtools` (>= 1.10) — reads BAM/CRAM header and extracts reads
 - `mosdepth` (>= 0.3) — coverage calculation
+- `bwa` — required for `--ratio DLOOP/ND1` only (chrMC re-alignment)
 - `awk`, `zcat`, `sort` (standard Unix)
 
 ```bash
-# Install mosdepth via conda (recommended)
-conda create -n mitrix -c bioconda mosdepth
+# Install mosdepth + bwa via conda (recommended)
+conda create -n mitrix -c bioconda mosdepth bwa
 conda activate mitrix
 
 # Make executable (once only)
@@ -60,9 +70,18 @@ mv mitRix ~/.local/bin/
 **HPC (module system):**
 ```bash
 module load samtools/1.23
+module load bwa
 module load miniconda3/
 conda activate mitrix
 ```
+
+**One-time setup for `DLOOP/ND1`** — build the chrMC circularised reference:
+```bash
+bash refs/make_chrMC.sh
+```
+This downloads rCRS (NC_012920.1), appends 700 bp (≈ 2× mean insert size) to
+create `refs/chrMC_rCRS.fa` (17,269 bp), and builds the BWA index. Only needed
+once; subsequent runs detect the existing index and skip this step.
 
 For CRAM inputs, pass `--reference-fasta`.
 
@@ -112,6 +131,7 @@ sits in):
 | `--target-bed FILE` | — | Override target as a BED file (any chromosome) |
 | `--reference-bed FILE` | — | Override reference as a BED file |
 | `--print-bed` | off | Print resolved BED files to stderr |
+| `--rotate-perbase` | off | Save `{sample}.chrMC.per-base.bed.gz` and `{sample}.chrM.corrected.per-base.bed.gz` to `--outdir` (DLOOP/ND1 only; useful for QC plots) |
 | `--keep-tmp` | off | Do not delete temp dir |
 
 **Common `--flag` values:**
@@ -191,17 +211,45 @@ sample  ratio  target  reference  stat  target_cov  ref_cov  ratio_value
 Per-base chrM coverage is saved as `{sample}.chrM.per-base.bed.gz` (and its
 `.csi` index) in `--outdir` if given, otherwise the current directory.
 
+## DLOOP/ND1 — chrMC re-alignment
+
+The D-loop amplicon (`chrM:16536-16569` + `chrM:1-34`) spans the linear
+reference break. In a standard BAM, reads that physically cross the 16569→1
+seam are soft-clipped at the edge, causing artificially low coverage at both
+ends of the amplicon and inflating the DLOOP/ND1 ratio by ~1.16×.
+
+`mitRix` fixes this by re-aligning all chrM reads to a circularised reference
+(**chrMC**) built by appending the first 700 bp of rCRS to the end of the
+genome (16,569 + 700 = 17,269 bp). The 700 bp extension is ≈ 2× the typical
+WGS mean insert size, ensuring >99.9% of seam-crossing read pairs are fully
+contained within the reference. After re-alignment with BWA in paired-end mode:
+
+- **arm1** (`chrMC:16536-16569`) — single unambiguous copy of the left arm
+- **arm2a** (`chrMC:1-34`) — reads BWA placed in the start copy of the right arm
+- **arm2b** (`chrMC:16570-16603`) — reads BWA placed in the appended seam copy
+
+D-loop depth = `(arm1_mean + arm2a_mean + arm2b_mean) / 2`
+
+ND1 is extracted from a corrected per-base file that folds the chrMC appended
+region back to chrM coordinates (modulo-sum). ND1 is at 3441–3504, well outside
+the appended zone (1–700 bp), so it is unaffected.
+
+Use `--rotate-perbase` to save the chrMC and corrected per-base files for QC
+inspection, then plot with `Rscript plot_dloop.R <outdir> <sample>`.
+
 ## Notes / caveats
 
 - The default `--flag 1796` excludes unmapped, non-primary, QC-failed, and
   duplicate reads — mirroring the deduplication step typical in WGS pipelines.
   Use `--flag 2820` to keep duplicates (closer to raw qPCR signal without
   dedup), or `--flag 3844` to additionally exclude supplementary alignments.
-- The D-loop default amplicon wraps the origin of replication on the linear
-  chrM reference (`chrM:16536-16569` → `chrM:1-34`). Supply
-  `--target START-END` with `END < START` and mitRix will auto-split at the
-  origin. Pile-up at the reference break can be uneven; this is inherent to
-  short-read mt mapping.
+- The D-loop default amplicon wraps the origin of replication (`chrM:16536-16569`
+  + `chrM:1-34`). `DLOOP/ND1` automatically re-aligns reads to the chrMC
+  circularised reference (see [DLOOP/ND1 — chrMC re-alignment](#dloopnd1--chrmc-re-alignment)
+  above) to avoid soft-clipping artefacts at the seam. If you supply a custom
+  `--target` that wraps the origin, mitRix will auto-split the interval at the
+  seam but will fall back to the original chrM per-base (no chrMC correction)
+  for non-default amplicons.
 - For a chrM-only BAM (no chr15), `mtDNA-CN` is automatically skipped when
   running `--all`. Supply `--reference-bed` to use a custom nuclear reference.
 - For T2T-CHM13 or a non-rCRS mt reference, supply `--target-bed` /
