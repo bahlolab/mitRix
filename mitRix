@@ -728,6 +728,11 @@ for RATIO in "${RATIOS[@]}"; do
       run_mosdepth_region "$WORK/${_slug}_reference" "$R_BED"
     fi
     R_MEAN=$(weighted_mean "$WORK/${_slug}_reference.regions.bed.gz")
+    rm -f "$WORK/${_slug}_reference.regions.bed.gz" \
+          "$WORK/${_slug}_reference.regions.bed.gz.csi" \
+          "$WORK/${_slug}_reference.mosdepth.summary.txt" \
+          "$WORK/${_slug}_reference.mosdepth.global.dist.txt" \
+          "$WORK/${_slug}_reference.mosdepth.region.dist.txt"
   else
     if [[ "$STAT" == "median" ]]; then
       R_MEAN=$(extract_from_perbase "$R_BED" "$_REF_PERBASE" | calc_median)
