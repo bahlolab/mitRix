@@ -10,7 +10,7 @@
 #
 #   ND1   : chrM:3485-3553       (69 bp)  ← Thermo Assay APAANDG (VIC/MGB)
 #   ND4   : chrM:12087-12170     (84 bp)  ← Thermo Custom CCU002NR (ABY/QSY)
-#   D-loop: chrM:16536-16569 + chrM:1-34  (~67 bp; spans origin)
+#   D-loop: chrM:16512-16569 + chrM:1-66  (124 bp; spans origin)
 #                                          ← Thermo Custom CCU002NR (JUN/QSY)
 #   ND5   : chrM:12874-12969      (96 bp) ← not part of the 4-plex; provided
 #                                            for ND5/ND1 ratio convenience
@@ -52,7 +52,7 @@ RATIOS (pick one; default: ND4/ND1)
 DEFAULT REGIONS (ThermoFisher 4-plex TaqMan amplicons)
   ND1    chrM:3485-3553                    (Thermo APAANDG, VIC/MGB)
   ND4    chrM:12087-12170                  (Thermo CCU002NR, ABY/QSY)
-  D-loop chrM:16536-16569 + chrM:1-34      (Thermo CCU002NR, JUN/QSY)
+  D-loop chrM:16512-16569 + chrM:1-66      (Thermo CCU002NR, JUN/QSY)
   ND5    chrM:12874-12969                  (not in 4-plex; for ND5/ND1)
   B2M    chr15 exon 2, build auto-detected (Thermo B2M FAM/MGB analog)
 
@@ -120,7 +120,7 @@ ROTATE_PERBASE=0   # save chrMC per-base to outdir for comparison
 ND1_RANGE="3485-3553"
 ND4_RANGE="12087-12170"
 ND5_RANGE="12874-12969"                  # not in 4-plex; sensible default
-DLOOP_RANGES=("1-34" "16536-16569")      # sorted ascending; wraps the origin
+DLOOP_RANGES=("1-66" "16512-16569")      # sorted ascending; wraps the origin
 
 # ----- parse args -----
 while (( "$#" )); do
@@ -572,7 +572,7 @@ for RATIO in "${RATIOS[@]}"; do
     # After re-alignment, a corrected chrM per-base file is built by folding
     # chrMC back to 16569 bp (modulo-sum): positions 1–700 receive depth from
     # both the start copy and the seam copy summed; positions 701–16569 are
-    # unchanged. D-loop (chrM:1-34 + chrM:16536-16569) and ND1 (chrM:3441-3504)
+    # unchanged. D-loop (chrM:1-66 + chrM:16512-16569) and ND1 (chrM:3485-3553)
     # are then extracted from this corrected file the same way as any other ratio.
     #
     # Build BWA index once (a few seconds, only if missing)
@@ -686,7 +686,7 @@ for RATIO in "${RATIOS[@]}"; do
 
     # Extract D-loop depth from the corrected chrM per-base.
     # The corrected file folds chrMC back to 16569 bp: positions 1-EXT have
-    # arm2a + arm2b already summed, so extracting chrM:1-34 and chrM:16536-16569
+    # arm2a + arm2b already summed, so extracting chrM:1-66 and chrM:16512-16569
     # directly gives the correct depth — identical to the 3-region formula but
     # without the extra complexity.
     # Custom --target falls back to the original chrM per-base (no correction).
