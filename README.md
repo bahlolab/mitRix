@@ -7,13 +7,13 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
 ```
 ./mitRix --bam sample.bam --ratio ND4/ND1
 # sample  ratio    target            reference       stat  target_cov  ref_cov  ratio_value
-# A1      ND4/ND1  chrM:12087-12170  chrM:3441-3504  mean  1284.51     1832.07  0.70
+# A1      ND4/ND1  chrM:12087-12170  chrM:3485-3553  mean  1284.51     1832.07  0.70
 ```
 
 ## Versions
 
-- **Basic (this directory).** Wet-lab Ct mimic. Defaults to the published
-  Thermo Fisher / Picard 4-plex TaqMan amplicon coordinates. Different labs
+- **Basic (this directory).** Wet-lab Ct mimic. Defaults to the ThermoFisher
+  4-plex TaqMan amplicon coordinates. Different labs
   can plug in their own targets via `--target` / `--target-bed` (and the
   reference counterparts).
 - **Plus (planned).** Dedicated methodology for three damage axes — major-arc
@@ -55,7 +55,7 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
 
 ```bash
 # Install mosdepth + bwa via conda (recommended)
-conda create -n mitrix -c bioconda mosdepth
+conda create -n mitrix -c bioconda mosdepth bwa
 conda activate mitrix
 
 # Make executable (once only)
@@ -68,10 +68,10 @@ mv mitRix ~/.local/bin/
 
 **HPC (module system):**
 ```bash
+module load samtools/1.23
+module load bwa
 module load miniconda3/
 conda activate mitrix
-module load samtools
-module load bwa
 ```
 
 **One-time setup for `DLOOP/ND1`** — build the chrMC circularised reference:
@@ -86,29 +86,28 @@ For CRAM inputs, pass `--reference-fasta`.
 
 ## Ratios and built-in defaults
 
-Default ratio is **`ND4/ND1`**. All default regions follow the published
-Thermo Fisher / Picard 4-plex TaqMan amplicons on the rCRS reference
+Default ratio is **`ND4/ND1`**. All default regions follow the ThermoFisher
+4-plex TaqMan amplicon coordinates on the rCRS reference
 (NC_012920.1, 16,569 bp). Coordinates are 1-based closed.
 
 | `--ratio`             | target (default)                         | reference (default)               | Thermo probe                              |
 | --------------------- | ---------------------------------------- | --------------------------------- | ----------------------------------------- |
-| `ND4/ND1` *(default)* | ND4, `chrM:12087-12170` (84 bp)          | ND1, `chrM:3441-3504` (64 bp)     | ND4-ABY/QSY (Custom CCU002NR)             |
-| `ND5/ND1`             | ND5, `chrM:12874-12969` (96 bp) †        | ND1, `chrM:3441-3504` (64 bp)     | ND5 not in 4-plex; ND1 = APAANDG VIC/MGB |
-| `DLOOP/ND1`           | D-loop, `chrM:1-34` + `chrM:16536-16569` | ND1, `chrM:3441-3504` (64 bp)     | DLOOP-JUN/QSY (Custom CCU002NR)           |
-| `mtDNA-CN`            | ND1, `chrM:3441-3504` (64 bp)            | B2M exon 2 (chr15, auto-detected) | B2M-FAM/MGB (analog of exon 2 amplicon)   |
+| `ND4/ND1` *(default)* | ND4, `chrM:12087-12170` (84 bp)          | ND1, `chrM:3485-3553` (69 bp)     | ND4-ABY/QSY (Custom CCU002NR)             |
+| `ND5/ND1`             | ND5, `chrM:12874-12969` (96 bp) †        | ND1, `chrM:3485-3553` (69 bp)     | ND5 not in 4-plex; ND1 = APAANDG VIC/MGB |
+| `DLOOP/ND1`           | D-loop, `chrM:1-34` + `chrM:16536-16569` | ND1, `chrM:3485-3553` (69 bp)     | DLOOP-JUN/QSY (Custom CCU002NR)           |
+| `mtDNA-CN`            | ND1, `chrM:3485-3553` (69 bp)            | B2M (chr15, auto-detected)        | B2M MGB-FAM (ThermoFisher APCFGXE)        |
 | `custom`              | `--target` / `--target-bed`              | `--reference` / `--reference-bed` | bring your own regions                    |
 
 † ND5 is not in the Thermo 4-plex; the default is a reasonable major-arc
 window provided so the `ND5/ND1` ratio works out of the box. Override with
 `--target` / `--target-bed` if your lab uses a different ND5 amplicon.
 
-B2M defaults (exon 2 of NM_004048, the same exon the B2M-FAM/MGB qPCR probe
-sits in):
+B2M defaults (ThermoFisher B2M MGB-FAM assay, APCFGXE, 95 bp amplicon):
 
 | Build         | Region (1-based closed)             | Length |
 | ------------- | ----------------------------------- | ------ |
-| hg38 / GRCh38 | `chr15:44,715,439-44,715,720`       | 282 bp |
-| hg19 / GRCh37 | `chr15:45,007,637-45,007,918`       | 282 bp |
+| hg38 / GRCh38 | `chr15:44,716,177-44,716,271`       | 95 bp  |
+| hg19 / GRCh37 | `chr15:45,008,375-45,008,469`       | 95 bp  |
 
 ## Options
 
@@ -173,7 +172,7 @@ sits in):
 ./mitRix --bam sample.cram --reference-fasta /refs/hg38.fa --all --median
 
 # Custom target region
-./mitRix --bam sample.bam --ratio ND4/ND1 --target 11333-11482 --reference 3441-3504
+./mitRix --bam sample.bam --ratio ND4/ND1 --target 11333-11482 --reference 3485-3553
 
 # Custom B2M amplicon
 ./mitRix --bam sample.bam --ratio mtDNA-CN --reference-bed my_B2M.bed
@@ -221,8 +220,7 @@ ends of the amplicon and inflating the DLOOP/ND1 ratio by ~1.16×.
 (**chrMC**) built by appending the first 700 bp of rCRS to the end of the
 genome (16,569 + 700 = 17,269 bp). The 700 bp extension is ≈ 2× the typical
 WGS mean insert size, ensuring >99.9% of seam-crossing read pairs are fully
-contained within the reference. 
-After re-alignment, a **corrected chrM per-base file** is built by folding
+contained within the reference. After re-alignment, a **corrected chrM per-base file** is built by folding
 chrMC back to 16,569 bp (modulo-sum): positions in the appended zone (1–700)
 receive depth from both the start copy and the seam copy summed together;
 positions 701–16,569 are unchanged.
@@ -256,10 +254,12 @@ inspection, then plot with `Rscript plot_dloop.R <outdir> <sample>`.
 
 ## Source of default coordinates
 
-- Trumpff C et al. *Stress and circulating cell-free mitochondrial DNA: a
-  systematic review of human studies, physiological considerations, and
-  technical recommendations.* (PMID: 33839318)
-- MitoQuicLy: high-throughput cf-mtDNA quantification (PMC: 9882007)
-- Sazonova MA et al. *Simultaneous quantification of mtDNA copy number and
-  deletion ratio: a multiplex real-time PCR assay.* Sci Rep 4: 3887 (2014)
-- The Picard Lab cell-free mtDNA assay (Columbia University)
+All default amplicon coordinates are taken directly from ThermoFisher assay
+datasheets (rCRS / NC_012920.1 for mtDNA; hg38/hg19 for B2M):
+
+| Assay | ThermoFisher product |
+| ----- | -------------------- |
+| ND1 `chrM:3485-3553`                         | Custom CCU002NR (APAANDG, VIC/MGB)  |
+| ND4 `chrM:12087-12170`                        | Custom CCU002NR (ABY/QSY)           |
+| D-loop `chrM:16536-16569` + `chrM:1-34`       | Custom CCU002NR (JUN/QSY)           |
+| B2M `chr15:44,716,177-44,716,271` (hg38)      | APCFGXE (MGB-FAM, Cat. #43320)     |
