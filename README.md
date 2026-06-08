@@ -17,8 +17,9 @@ wet-lab TaqMan Ct ratio so the two read-outs are directly comparable.
   can plug in their own targets via `--target` / `--target-bed` (and the
   reference counterparts).
 - **Plus (planned).** Dedicated methodology for three damage axes — major-arc
-  large deletion burden, 7S DNA / replication activity, and mtDNA copy number.
-  Not implemented yet.
+  large deletion burden, 7S DNA / replication activity, and mtDNA copy number
+  — with GC-bias correction, NUMT/MAPQ filtering, duplicate-aware depth,
+  bootstrap CIs, etc. Not implemented yet.
 
 ## What it does
 
@@ -94,7 +95,7 @@ Default ratio is **`ND4/ND1`**. All default regions follow the ThermoFisher
 | --------------------- | ---------------------------------------- | --------------------------------- | ----------------------------------------- |
 | `ND4/ND1` *(default)* | ND4, `chrM:12087-12170` (84 bp)          | ND1, `chrM:3485-3553` (69 bp)     | ND4-ABY/QSY (Custom CCU002NR)             |
 | `ND5/ND1`             | ND5, `chrM:12874-12969` (96 bp) †        | ND1, `chrM:3485-3553` (69 bp)     | ND5 not in 4-plex; ND1 = APAANDG VIC/MGB |
-| `DLOOP/ND1`           | D-loop, `chrM:1-34` + `chrM:16536-16569` | ND1, `chrM:3485-3553` (69 bp)     | DLOOP-JUN/QSY (Custom CCU002NR)           |
+| `DLOOP/ND1`           | D-loop, `chrM:1-66` + `chrM:16512-16569` | ND1, `chrM:3485-3553` (69 bp)     | DLOOP-JUN/QSY (Custom CCU002NR)           |
 | `mtDNA-CN`            | ND1, `chrM:3485-3553` (69 bp)            | B2M (chr15, auto-detected)        | B2M MGB-FAM (ThermoFisher APCFGXE)        |
 | `custom`              | `--target` / `--target-bed`              | `--reference` / `--reference-bed` | bring your own regions                    |
 
@@ -199,7 +200,7 @@ TSV with 8 columns written to stdout:
 sample  ratio  target  reference  stat  target_cov  ref_cov  ratio_value
 ```
 
-- `target` / `reference` encode all intervals, e.g. `chrM:1-34,16536-16569`
+- `target` / `reference` encode all intervals, e.g. `chrM:1-66,16512-16569`
   for the D-loop pair.
 - `stat` is `mean` or `median` depending on `--mean` / `--median`.
 - `target_cov` / `ref_cov` are rounded to 2 decimal places.
@@ -211,7 +212,7 @@ Per-base chrM coverage is saved as `{sample}.chrM.per-base.bed.gz` (and its
 
 ## DLOOP/ND1 — chrMC re-alignment
 
-The D-loop amplicon (`chrM:16536-16569` + `chrM:1-34`) spans the linear
+The D-loop amplicon (`chrM:16512-16569` + `chrM:1-66`) spans the linear
 reference break. In a standard BAM, reads that physically cross the 16569→1
 seam are soft-clipped at the edge, causing artificially low coverage at both
 ends of the amplicon and inflating the DLOOP/ND1 ratio by ~1.16×.
@@ -261,5 +262,5 @@ datasheets (rCRS / NC_012920.1 for mtDNA; hg38/hg19 for B2M):
 | ----- | -------------------- |
 | ND1 `chrM:3485-3553`                         | Custom CCU002NR (APAANDG, VIC/MGB)  |
 | ND4 `chrM:12087-12170`                        | Custom CCU002NR (ABY/QSY)           |
-| D-loop `chrM:16536-16569` + `chrM:1-34`       | Custom CCU002NR (JUN/QSY)           |
+| D-loop `chrM:16512-16569` + `chrM:1-66`       | Custom CCU002NR (JUN/QSY)           |
 | B2M `chr15:44,716,177-44,716,271` (hg38)      | APCFGXE (MGB-FAM, Cat. #43320)     |
