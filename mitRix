@@ -5,18 +5,18 @@
 # Output (TSV on stdout):
 #   sample  ratio  target  reference  target_mean_cov  ref_mean_cov  ratio_value
 #
-# Built-in defaults follow the published Thermo Fisher / Picard 4-plex
-# TaqMan amplicons (Trumpff/Picard, rCRS = NC_012920.1, 16569 bp):
+# Built-in defaults follow the ThermoFisher 4-plex TaqMan amplicon
+# coordinates (rCRS = NC_012920.1, 16569 bp):
 #
-#   ND1   : chrM:3441-3504       (64 bp)  ← Thermo Assay APAANDG (VIC/MGB)
+#   ND1   : chrM:3485-3553       (69 bp)  ← Thermo Assay APAANDG (VIC/MGB)
 #   ND4   : chrM:12087-12170     (84 bp)  ← Thermo Custom CCU002NR (ABY/QSY)
 #   D-loop: chrM:16536-16569 + chrM:1-34  (~67 bp; spans origin)
 #                                          ← Thermo Custom CCU002NR (JUN/QSY)
 #   ND5   : chrM:12874-12969      (96 bp) ← not part of the 4-plex; provided
 #                                            for ND5/ND1 ratio convenience
-#   B2M   : chr15 exon 2 (~282 bp)        ← analog of B2M-FAM/MGB amplicon
-#             hg38: chr15:44,715,439-44,715,720
-#             hg19: chr15:45,007,637-45,007,918
+#   B2M   : chr15 (95 bp)                 ← ThermoFisher B2M MGB-FAM (APCFGXE)
+#             hg38: chr15:44,716,177-44,716,271
+#             hg19: chr15:45,008,375-45,008,469
 #
 # All defaults are overridable per-side with --target/--reference (range on
 # chrM) or --target-bed/--reference-bed (any chromosome) so labs using a
@@ -49,8 +49,8 @@ RATIOS (pick one; default: ND4/ND1)
   --ratio mtDNA-CN          ND1 / B2M       (mtDNA copy number proxy)
   --ratio custom            requires --target AND --reference (or BEDs)
 
-DEFAULT REGIONS (Thermo / Picard 4-plex amplicons)
-  ND1    chrM:3441-3504                    (Thermo APAANDG, VIC/MGB)
+DEFAULT REGIONS (ThermoFisher 4-plex TaqMan amplicons)
+  ND1    chrM:3485-3553                    (Thermo APAANDG, VIC/MGB)
   ND4    chrM:12087-12170                  (Thermo CCU002NR, ABY/QSY)
   D-loop chrM:16536-16569 + chrM:1-34      (Thermo CCU002NR, JUN/QSY)
   ND5    chrM:12874-12969                  (not in 4-plex; for ND5/ND1)
@@ -116,8 +116,8 @@ STAT="mean"
 FLAG=1796          # mosdepth -F: exclude reads with any of these bits set
 ROTATE_PERBASE=0   # save chrMC per-base to outdir for comparison
 
-# rCRS default intervals (1-based, inclusive) — Thermo/Picard 4-plex amplicons
-ND1_RANGE="3441-3504"
+# rCRS default intervals (1-based, inclusive) — ThermoFisher 4-plex TaqMan amplicons
+ND1_RANGE="3485-3553"
 ND4_RANGE="12087-12170"
 ND5_RANGE="12874-12969"                  # not in 4-plex; sensible default
 DLOOP_RANGES=("1-34" "16536-16569")      # sorted ascending; wraps the origin
@@ -502,17 +502,17 @@ for RATIO in "${RATIOS[@]}"; do
           BUILD=$(detect_build "$CHR15_LEN")
           case "$BUILD" in
             hg38/GRCh38)
-              printf '%s\t%s\t%s\n' "$CHR15" 44715438 44715720 > "$R_BED"
+              printf '%s\t%s\t%s\n' "$CHR15" 44716176 44716271 > "$R_BED"
               ;;
             hg19/GRCh37)
-              printf '%s\t%s\t%s\n' "$CHR15" 45007636 45007918 > "$R_BED"
+              printf '%s\t%s\t%s\n' "$CHR15" 45008374 45008469 > "$R_BED"
               ;;
             *)
               log "could not auto-detect nuclear build from chr15 length=$CHR15_LEN."
               log "For B2M coordinates on your reference, supply --reference-bed FILE."
               log "Reference BED examples (1-based closed coords; B2M exon 2):"
-              log "  hg19/GRCh37: chr15  45007636  45007918"
-              log "  hg38/GRCh38: chr15  44715438  44715720"
+              log "  hg19/GRCh37: chr15  45008374  45008469"
+              log "  hg38/GRCh38: chr15  44716176  44716271"
               die "unknown reference build for chr15 length=$CHR15_LEN"
               ;;
           esac
