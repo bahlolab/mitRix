@@ -26,8 +26,9 @@ task mitRix {
     String stat_flag  = if stat == "median" then "--median" else "--mean"
 
     command {
-        set -euo pipefail
+        set -eo pipefail
 
+        export MAMBA_SKIP_ACTIVATE=0
         source /usr/local/bin/_activate_current_env.sh
 
         # CRAM index must sit beside the CRAM file
