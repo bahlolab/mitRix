@@ -47,13 +47,16 @@ task mitRix {
             --flag            ~{flag} \
             --threads         ~{cpus} \
             --outdir          outdir \
+            --rotate-perbase \
             > ~{sample_id}.mitrix.tsv
     }
 
     output {
-        File tsv              = "~{sample_id}.mitrix.tsv"
-        File chrm_perbase     = "outdir/~{sample_id}.chrM.per-base.bed.gz"
-        File chrm_perbase_csi = "outdir/~{sample_id}.chrM.per-base.bed.gz.csi"
+        File tsv                  = "~{sample_id}.mitrix.tsv"
+        File chrm_perbase         = "outdir/~{sample_id}.chrM.per-base.bed.gz"
+        File chrm_perbase_csi     = "outdir/~{sample_id}.chrM.per-base.bed.gz.csi"
+        File chrmc_perbase        = "outdir/~{sample_id}.chrMC.per-base.bed.gz"
+        File chrm_corrected       = "outdir/~{sample_id}.chrM.corrected.per-base.bed.gz"
     }
 
     runtime {
@@ -92,8 +95,8 @@ workflow mitRix_wf {
     }
 
     output {
-        File tsv              = mitRix.tsv
-        File chrm_perbase     = mitRix.chrm_perbase
+        File mitRix           = mitRix.tsv
+        File base_cov2        = mitRix.chrm_perbase
         File chrm_perbase_csi = mitRix.chrm_perbase_csi
     }
 }
