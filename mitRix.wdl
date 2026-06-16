@@ -1,40 +1,26 @@
 version 1.0
 
-struct IndexedCram {
-    File cram
-    File crai
-}
-
-struct IndexedFasta {
-    File fasta
-    File fai
-}
-
 task mitRix {
     input {
-        IndexedCram cram
-        IndexedFasta reference
+        File   cram
+        File   crai
+        File   reference_fasta
+        File   reference_fasta_fai
         String sample_id
 
         # Ratio: "ND4/ND1", "ND5/ND1", "DLOOP/ND1", "mtDNA-CN", or "all"
         String ratio = "all"
         # Stat: "mean" or "median"
         String stat  = "mean"
-        # mosdepth -F flag (1796 = exclude unmapped/non-primary/QC-fail/dup)
+        # mosdepth -F flag
         Int    flag  = 1796
         Int    cpus  = 4
 
-        String memory     = "16G"
-        String disk_space = "local-disk ${disk_space_int} HDD"
+        String memory      = "16G"
         Int    preemptible = 2
     }
 
-    Int disk_space_int = ceil(1.2 * size([
-        cram.cram,
-        cram.crai,
-        reference.fasta,
-        reference.fai
-    ], "G"))
+    Int disk_space_int = ceil(1.2 * size([cram, crai, reference_fasta, reference_fasta_fai], "G"))
 
     String ratio_flag = if ratio == "all" then "--all" else "--ratio ~{ratio}"
     String stat_flag  = if stat == "median" then "--median" else "--mean"
@@ -45,15 +31,13 @@ task mitRix {
         source /usr/local/bin/_activate_current_env.sh
 
         # CRAM index must sit beside the CRAM file
-        if [[ ! -f "~{cram.cram}.crai" ]]; then
-            ln -sf ~{cram.crai} ~{cram.cram}.crai
-        fi
+        ln -sf ~{crai} ~{cram}.crai
 
         mkdir -p outdir
 
         /app/mitRix \
-            --bam             ~{cram.cram} \
-            --reference-fasta ~{reference.fasta} \
+            --bam             ~{cram} \
+            --reference-fasta ~{reference_fasta} \
             --sample          ~{sample_id} \
             ~{ratio_flag} \
             ~{stat_flag} \
@@ -73,13 +57,36 @@ task mitRix {
         docker:      "ghcr.io/bahlolab/mitrix:latest"
         cpu:         cpus
         memory:      memory
-        disks:       disk_space
+        disks:       "local-disk ~{disk_space_int} HDD"
         preemptible: preemptible
     }
 }
 
 workflow mitRix_wf {
-    call mitRix
+    input {
+        File   cram
+        File   crai
+        File   reference_fasta
+        File   reference_fasta_fai
+        String sample_id
+        String ratio = "all"
+        String stat  = "mean"
+        Int    flag  = 1796
+        Int    cpus  = 4
+    }
+
+    call mitRix {
+        input:
+            cram                = cram,
+            crai                = crai,
+            reference_fasta     = reference_fasta,
+            reference_fasta_fai = reference_fasta_fai,
+            sample_id           = sample_id,
+            ratio               = ratio,
+            stat                = stat,
+            flag                = flag,
+            cpus                = cpus
+    }
 
     output {
         File tsv              = mitRix.tsv
