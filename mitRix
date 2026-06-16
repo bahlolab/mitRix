@@ -1,0 +1,761 @@
+#!/usr/bin/env bash
+# mitRix (Basic) — estimate mtDNA damage as a BAM/CRAM coverage ratio
+# that mimics the wet-lab TaqMan Ct ratio.
+#
+# Output (TSV on stdout):
+#   sample  ratio  target  reference  target_mean_cov  ref_mean_cov  ratio_value
+#
+# Built-in defaults follow the ThermoFisher 4-plex TaqMan amplicon
+# coordinates (rCRS = NC_012920.1, 16569 bp):
+#
+#   ND1   : chrM:3485-3553       (69 bp)  ← Thermo Assay APAANDG (VIC/MGB)
+#   ND4   : chrM:12087-12170     (84 bp)  ← Thermo Custom CCU002NR (ABY/QSY)
+#   D-loop: chrM:16512-16569 + chrM:1-66  (124 bp; spans origin)
+#                                          ← Thermo Custom CCU002NR (JUN/QSY)
+#   ND5   : chrM:12874-12969      (96 bp) ← not part of the 4-plex; provided
+#                                            for ND5/ND1 ratio convenience
+#   B2M   : chr15 (95 bp)                 ← ThermoFisher B2M MGB-FAM (APCFGXE)
+#             hg38: chr15:44,716,177-44,716,271
+#             hg19: chr15:45,008,375-45,008,469
+#
+# All defaults are overridable per-side with --target/--reference (range on
+# chrM) or --target-bed/--reference-bed (any chromosome) so labs using a
+# different probe design can plug in their own coordinates.
+#
+# The mtDNA contig name (chrM / MT / chrMT / NC_012920.1) and the nuclear
+# build (hg19 vs hg38, used to pick B2M coordinates for mtDNA-CN) are
+# auto-detected from the BAM/CRAM @SQ header.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+VERSION="0.1.0"
+PROG="mitRix"
+
+usage() {
+  cat >&2 <<HELP_END
+${PROG} v${VERSION} (Basic) — mtDNA damage estimator (NGS analog of wet-lab Ct ratio)
+
+USAGE
+  ${PROG} --bam FILE [--ratio NAME] [options]
+
+REQUIRED
+  --bam FILE                BAM or CRAM (indexed)
+
+RATIOS (pick one; default: ND4/ND1)
+  --ratio ND4/ND1           ND4 / ND1       (major-arc damage proxy)
+  --ratio ND5/ND1           ND5 / ND1       (major-arc damage proxy)
+  --ratio DLOOP/ND1         D-loop / ND1    (7S DNA / mtDNA replication proxy)
+  --ratio mtDNA-CN          ND1 / B2M       (mtDNA copy number proxy)
+  --ratio custom            requires --target AND --reference (or BEDs)
+
+DEFAULT REGIONS (ThermoFisher 4-plex TaqMan amplicons)
+  ND1    chrM:3485-3553                    (Thermo APAANDG, VIC/MGB)
+  ND4    chrM:12087-12170                  (Thermo CCU002NR, ABY/QSY)
+  D-loop chrM:16512-16569 + chrM:1-66      (Thermo CCU002NR, JUN/QSY)
+  ND5    chrM:12874-12969                  (not in 4-plex; for ND5/ND1)
+  B2M    chr15 exon 2, build auto-detected (Thermo B2M FAM/MGB analog)
+
+CUSTOM REGIONS  (override either side of the chosen ratio)
+  --target START-END        target  interval on chrM (1-based closed)
+  --reference START-END     reference interval on chrM (1-based closed)
+  --target-bed FILE         target BED (multi-interval allowed)
+  --reference-bed FILE      reference BED (e.g. your own B2M coords)
+
+OTHER
+  --reference-fasta FA      reference FASTA (required for CRAM)
+  --sample NAME             sample name in output (default: BAM basename)
+  --threads N               threads for mosdepth (default: 4)
+  --outdir DIR              keep mosdepth output here (default: tmp dir)
+  --keep-tmp                do not delete temp dir
+  --all                     run all ratios (ND4/ND1, ND5/ND1, DLOOP/ND1, mtDNA-CN);
+                            incompatible with --target/--reference/--target-bed/--reference-bed
+  --mean                    use length-weighted mean coverage for ratio (default)
+  --median                  use median per-base coverage for ratio
+  --flag INT                mosdepth -F: exclude reads with any of these SAM flag bits set
+                            default 1796 (unmapped + not-primary + QC-fail + duplicate)
+                            2820  = drop supplementary instead of duplicates
+                            3844  = drop both duplicates and supplementary
+  --rotate-perbase          save chrMC per-base as {outdir}/{sample}.chrMC.per-base.bed.gz
+                            for visual comparison with the original chrM per-base file
+                            (chrMC coords: 1-16569 same as chrM; 16570-17269 = appended copy)
+  --no-header               suppress TSV header
+  --print-bed               print the resolved BED files to stderr
+  --version
+  -h, --help
+
+EXAMPLES
+  ${PROG} --bam sample.bam                                  # default: ND4/ND1
+  ${PROG} --bam sample.bam --ratio ND5/ND1
+  ${PROG} --bam sample.bam --ratio DLOOP/ND1 --sample S001
+  ${PROG} --bam sample.cram --reference-fasta hg38.fa --ratio mtDNA-CN
+  ${PROG} --bam sample.bam --ratio custom --target 8470-13447 --reference 3441-3504
+  ${PROG} --bam sample.bam --ratio mtDNA-CN --reference-bed my_B2M.bed
+HELP_END
+}
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 2; }
+log() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# ----- defaults -----
+RATIO="ND4/ND1"
+BAM=""
+SAMPLE=""
+THREADS=4
+TARGET_RANGE=""
+REF_RANGE=""
+TARGET_BED=""
+REF_BED=""
+FASTA=""
+OUTDIR=""
+KEEP_TMP=0
+NO_HEADER=0
+PRINT_BED=0
+ALL=0
+STAT="mean"
+FLAG=1796          # mosdepth -F: exclude reads with any of these bits set
+ROTATE_PERBASE=0   # save chrMC per-base to outdir for comparison
+
+# rCRS default intervals (1-based, inclusive) — ThermoFisher 4-plex TaqMan amplicons
+ND1_RANGE="3485-3553"
+ND4_RANGE="12087-12170"
+ND5_RANGE="12874-12969"                  # not in 4-plex; sensible default
+DLOOP_RANGES=("1-66" "16512-16569")      # sorted ascending; wraps the origin
+
+# ----- parse args -----
+while (( "$#" )); do
+  case "$1" in
+    --bam)              BAM="$2"; shift 2;;
+    --ratio)            RATIO="$2"; shift 2;;
+    --target)           TARGET_RANGE="$2"; shift 2;;
+    --reference)        REF_RANGE="$2"; shift 2;;
+    --target-bed)       TARGET_BED="$2"; shift 2;;
+    --reference-bed)    REF_BED="$2"; shift 2;;
+    --reference-fasta)  FASTA="$2"; shift 2;;
+    --sample)           SAMPLE="$2"; shift 2;;
+    --threads)          THREADS="$2"; shift 2;;
+    --outdir)           OUTDIR="$2"; shift 2;;
+    --keep-tmp)         KEEP_TMP=1; shift;;
+    --no-header)        NO_HEADER=1; shift;;
+    --print-bed)        PRINT_BED=1; shift;;
+    --all)              ALL=1; shift;;
+    --mean)             STAT="mean"; shift;;
+    --median)           STAT="median"; shift;;
+    --flag)             FLAG="$2"; shift 2;;
+    --rotate-perbase)   ROTATE_PERBASE=1; shift;;
+    --version)          echo "${PROG} ${VERSION}"; exit 0;;
+    -h|--help)          usage; exit 0;;
+    --)                 shift; break;;
+    -*)                 die "unknown option: $1";;
+    *)                  die "unexpected argument: $1";;
+  esac
+done
+
+[[ -n "$BAM" ]] || { usage; die "--bam is required"; }
+[[ -e "$BAM" ]] || die "BAM/CRAM not found: $BAM"
+
+if (( ALL )); then
+  [[ -z "$TARGET_RANGE" ]] || die "--all is incompatible with --target; run a single --ratio to override regions"
+  [[ -z "$TARGET_BED"   ]] || die "--all is incompatible with --target-bed"
+  [[ -z "$REF_RANGE"    ]] || die "--all is incompatible with --reference"
+  [[ -z "$REF_BED"      ]] || die "--all is incompatible with --reference-bed; to use a custom B2M, run --ratio mtDNA-CN --reference-bed FILE"
+fi
+
+[[ "$FLAG" =~ ^[0-9]+$ ]] || die "--flag must be a non-negative integer: $FLAG"
+
+# DLOOP/ND1 always uses chrMC re-alignment — check BWA + reference early
+CHRMC_REF="$SCRIPT_DIR/refs/chrMC_rCRS.fa"
+_will_use_dloop=0
+case "$RATIO" in DLOOP/ND1|D-LOOP/ND1|D-loop/ND1|dloop/ND1) _will_use_dloop=1;; esac
+(( ALL )) && _will_use_dloop=1
+
+# ----- dependency checks -----
+command -v samtools >/dev/null 2>&1 || die "samtools not found in PATH"
+command -v mosdepth >/dev/null 2>&1 || die "mosdepth not found in PATH (install: conda install -c bioconda mosdepth)"
+command -v awk      >/dev/null 2>&1 || die "awk not found in PATH"
+command -v zcat     >/dev/null 2>&1 || die "zcat not found in PATH"
+if (( _will_use_dloop )); then
+  command -v bwa >/dev/null 2>&1 \
+    || die "bwa not found in PATH (required for DLOOP/ND1; module load bwa)"
+  [[ -f "$CHRMC_REF" ]] \
+    || die "chrMC reference not found: $CHRMC_REF\nRun: bash refs/make_chrMC.sh"
+fi
+
+# index check (warn only — samtools/mosdepth will error if truly missing)
+case "$BAM" in
+  *.cram)
+    [[ -e "${BAM}.crai" || -e "${BAM%.cram}.crai" ]] || log "warning: no .crai index found beside $BAM"
+    ;;
+  *.bam)
+    [[ -e "${BAM}.bai" || -e "${BAM%.bam}.bai" || -e "${BAM}.csi" ]] \
+      || log "warning: no .bai/.csi index found beside $BAM"
+    ;;
+esac
+
+# CRAM needs FASTA
+if [[ "$BAM" == *.cram && -z "$FASTA" ]]; then
+  die "CRAM input requires --reference-fasta"
+fi
+
+SAMTOOLS_REF_OPT=()
+MOSDEPTH_FASTA_OPT=()
+if [[ -n "$FASTA" ]]; then
+  [[ -e "$FASTA" ]] || die "reference FASTA not found: $FASTA"
+  SAMTOOLS_REF_OPT=(--reference "$FASTA")
+  MOSDEPTH_FASTA_OPT=(--fasta "$FASTA")
+fi
+
+# sample name default
+if [[ -z "$SAMPLE" ]]; then
+  SAMPLE=$(basename "$BAM")
+  SAMPLE="${SAMPLE%.bam}"
+  SAMPLE="${SAMPLE%.cram}"
+fi
+
+# ----- read @SQ from BAM/CRAM header -----
+HDR=$(samtools view -H "${SAMTOOLS_REF_OPT[@]}" "$BAM") || die "failed to read header from $BAM"
+
+SQ=$(printf '%s\n' "$HDR" | awk 'BEGIN{OFS="\t"}
+  /^@SQ/ {
+    sn=""; ln="";
+    for (i=2;i<=NF;i++){
+      if ($i ~ /^SN:/) sn=substr($i,4);
+      else if ($i ~ /^LN:/) ln=substr($i,4);
+    }
+    if (sn != "") print sn, ln;
+  }')
+
+# detect mtDNA contig
+MT_CHR=""; MT_LEN=""
+for cand in chrM MT chrMT NC_012920.1 NC_012920; do
+  line=$(printf '%s\n' "$SQ" | awk -v c="$cand" '$1==c{print; exit}') || true
+  if [[ -n "$line" ]]; then
+    MT_CHR=$(printf '%s' "$line" | cut -f1)
+    MT_LEN=$(printf '%s' "$line" | cut -f2)
+    break
+  fi
+done
+if [[ -z "$MT_CHR" ]]; then
+  # fall back: any SQ with LN=16569
+  line=$(printf '%s\n' "$SQ" | awk '$2==16569{print; exit}') || true
+  if [[ -n "$line" ]]; then
+    MT_CHR=$(printf '%s' "$line" | cut -f1)
+    MT_LEN=$(printf '%s' "$line" | cut -f2)
+  fi
+fi
+[[ -n "$MT_CHR" ]] || die "no mtDNA contig (chrM/MT/chrMT/NC_012920.1 or LN=16569) found in BAM header"
+
+if [[ "$MT_LEN" != "16569" ]]; then
+  log "warning: mtDNA contig '$MT_CHR' has length $MT_LEN, not 16569 (rCRS). The built-in default coordinates assume rCRS — verify with --target/--reference or --target-bed/--reference-bed."
+else
+  log "mtDNA contig: $MT_CHR (rCRS, 16569 bp)"
+fi
+
+# detect chr15 (for B2M)
+CHR15=""; CHR15_LEN=""
+for cand in chr15 15; do
+  line=$(printf '%s\n' "$SQ" | awk -v c="$cand" '$1==c{print; exit}') || true
+  if [[ -n "$line" ]]; then
+    CHR15=$(printf '%s' "$line" | cut -f1)
+    CHR15_LEN=$(printf '%s' "$line" | cut -f2)
+    break
+  fi
+done
+
+detect_build() {
+  # chr15 length -> build label
+  case "$1" in
+    102531392) echo "hg19/GRCh37";;
+    101991189) echo "hg38/GRCh38";;
+    *)         echo "unknown";;
+  esac
+}
+
+# ----- assemble target / reference BED files -----
+TMP=$(mktemp -d -t mitrix.XXXXXX)
+cleanup() {
+  if (( KEEP_TMP )); then
+    log "kept temp dir: $TMP"
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -n "$OUTDIR" ]]; then
+  mkdir -p "$OUTDIR"
+  WORK="$OUTDIR"
+else
+  WORK="$TMP/work"; mkdir -p "$WORK"
+fi
+
+# Append a 1-based closed range as a BED line (0-based half-open)
+append_range() {  # chr  start-end  outfile
+  local chr=$1 range=$2 out=$3 s e
+  if [[ ! "$range" =~ ^[0-9]+-[0-9]+$ ]]; then
+    die "bad range '$range' (expected START-END, 1-based inclusive)"
+  fi
+  s=${range%-*}; e=${range#*-}
+  (( s >= 1 )) || die "bad range '$range' (start must be >= 1)"
+  if (( e < s )); then
+    # wrap-around range (end < start) — auto-split at the origin
+    # only valid for the mtDNA contig (circular reference stored linearly)
+    [[ "$chr" == "$MT_CHR" && -n "$MT_LEN" ]] \
+      || die "bad range '$range' (end < start; wrap-around is only valid for the mtDNA contig)"
+    (( e >= 1 )) || die "bad range '$range' (end must be >= 1 for a wrap-around range)"
+    log "wrap-around range $range: auto-splitting into ${s}-${MT_LEN} + 1-${e}"
+    awk -v c="$chr" -v s="$s" -v e="$MT_LEN" 'BEGIN{print c"\t"(s-1)"\t"e}' >> "$out"
+    awk -v c="$chr" -v s=1    -v e="$e"       'BEGIN{print c"\t"0"\t"e}'      >> "$out"
+    return
+  fi
+  awk -v c="$chr" -v s="$s" -v e="$e" 'BEGIN{print c"\t"(s-1)"\t"e}' >> "$out"
+}
+
+# Sort a BED file in place (chrom, then numeric start)
+sort_bed_inplace() {
+  local f=$1
+  LC_ALL=C sort -k1,1 -k2,2n "$f" -o "$f"
+}
+
+# Resolve target / reference for a given ratio
+# `side`: "target" or "reference"
+# `out` : BED file to write
+resolve_side() {  # side default-chr default-ranges(space-sep)  out  userRange  userBed
+  local side=$1; shift
+  local def_chr=$1; shift
+  local def_ranges=$1; shift
+  local out=$1; shift
+  local userRange=$1; shift
+  local userBed=$1; shift
+
+  if [[ -n "$userBed" ]]; then
+    [[ -e "$userBed" ]] || die "$side BED not found: $userBed"
+    cp "$userBed" "$out"
+    return
+  fi
+  if [[ -n "$userRange" ]]; then
+    append_range "$def_chr" "$userRange" "$out"
+    return
+  fi
+  [[ -n "$def_ranges" ]] || die "no default $side region for ratio '$RATIO'"
+  local r
+  for r in $def_ranges; do
+    append_range "$def_chr" "$r" "$out"
+  done
+}
+
+# Verify all BED chromosomes are present in the BAM header
+verify_bed_chroms() {
+  local f=$1 label=$2
+  local missing
+  missing=$(awk 'NR==FNR{a[$1]=1; next} !($1 in a){print $1}' \
+             <(printf '%s\n' "$SQ" | cut -f1) "$f" | sort -u || true)
+  if [[ -n "$missing" ]]; then
+    die "$label BED contains chrom(s) not present in BAM header: $(echo "$missing" | tr '\n' ' ')"
+  fi
+}
+
+# Run mosdepth for a BED region (-n = regions output only; no per-base file)
+# Extra flags (e.g. --use-median) are forwarded to mosdepth
+run_mosdepth_region() {  # prefix bed [extra_mosdepth_flags...]
+  local prefix=$1 bed=$2; shift 2
+  mosdepth -n -t "$THREADS" -F "$FLAG" --by "$bed" "$@" "${MOSDEPTH_FASTA_OPT[@]}" "$prefix" "$BAM" \
+    2> >(grep -v "\[W::hts_idx_load3\]" >&2) \
+    || die "mosdepth failed (bed=$bed prefix=$prefix)"
+}
+
+# Length-weighted mean from a mosdepth regions file (used for B2M mean)
+weighted_mean() {  # regions.bed.gz
+  local f=$1
+  [[ -e "$f" ]] || die "mosdepth output missing: $f"
+  zcat "$f" | awk 'BEGIN{tot=0; len=0}
+    { l = $3 - $2; if (l<=0) next; tot += l * $4; len += l }
+    END { if (len > 0) printf "%.2f", tot/len; else print "NA" }'
+}
+
+# Extract per-base depths for BED intervals from a mosdepth per-base file.
+# mosdepth per-base uses RLE: one record may cover many positions with the same
+# depth (e.g. "chrM 16535 16553 4944" = 18 positions, all depth 4944).
+# We expand to one output value per overlapping position so that calc_mean gets
+# a position-weighted mean and calc_median gets a position-level median.
+extract_from_perbase() {  # bed perbase_gz
+  local bed=$1 perbase=$2
+  [[ -e "$perbase" ]] || die "per-base output missing: $perbase"
+  zcat "$perbase" | awk -v bedfile="$bed" '
+    BEGIN { while ((getline < bedfile) > 0) { c[++n]=$1; s[n]=$2+0; e[n]=$3+0 } }
+    {
+      for (i=1;i<=n;i++) {
+        if ($1==c[i]) {
+          os = ($2+0 > s[i]) ? $2+0 : s[i]   # overlap start
+          oe = ($3+0 < e[i]) ? $3+0 : e[i]   # overlap end
+          if (oe > os) {
+            for (p=os; p<oe; p++) print $4+0  # one value per overlapping bp
+          }
+        }
+      }
+    }
+  '
+}
+
+# Arithmetic mean from per-base depth values on stdin
+calc_mean() {
+  awk 'BEGIN{tot=0; n=0}
+    {tot+=$1; n++}
+    END{if(n>0) printf "%.2f", tot/n; else print "NA"}'
+}
+
+# Median from per-base depth values on stdin
+calc_median() {
+  sort -n | awk '
+    { a[NR]=$1 }
+    END {
+      if (NR==0) { print "NA"; exit }
+      mid = (NR+1)/2
+      if (NR%2==1) printf "%.2f", a[int(mid)]
+      else          printf "%.2f", (a[int(mid)] + a[int(mid)+1]) / 2
+    }
+  '
+}
+
+# Format a BED file back to human-readable region string
+fmt_regions() {  # bed file
+  awk 'BEGIN{prev=""}
+       {
+         s=$2+1; e=$3;
+         if ($1 != prev) {
+           if (prev != "") printf ";"
+           printf "%s:%d-%d", $1, s, e
+           prev=$1
+         } else {
+           printf ",%d-%d", s, e
+         }
+       }
+       END { printf "\n" }' "$1"
+}
+
+# ----- run mosdepth once for chrM per-base coverage -----
+# output saved to --outdir if given, otherwise current directory
+CHRM_OUT_DIR="${OUTDIR:-$PWD}"
+CHRM_PREFIX="$CHRM_OUT_DIR/${SAMPLE}.chrM"
+log "computing chrM per-base coverage → ${CHRM_PREFIX}.per-base.bed.gz"
+mosdepth -t "$THREADS" -F "$FLAG" -c "$MT_CHR" "${MOSDEPTH_FASTA_OPT[@]}" "$CHRM_PREFIX" "$BAM" \
+  2> >(grep -v "\[W::hts_idx_load3\]" >&2) \
+  || die "mosdepth failed for chrM per-base coverage"
+CHRM_PERBASE_GZ="${CHRM_PREFIX}.per-base.bed.gz"
+[[ -e "$CHRM_PERBASE_GZ" ]] || die "chrM per-base output not found: $CHRM_PERBASE_GZ"
+rm -f "${CHRM_PREFIX}.mosdepth.summary.txt" "${CHRM_PREFIX}.mosdepth.global.dist.txt"
+
+# Expand mosdepth RLE to one line per base position (makes the saved file
+# easier to inspect and use directly in R or other tools).
+# e.g. "chrM 3441 3504 5000" (63 positions) → 63 individual lines.
+log "expanding chrM per-base RLE → one line per position"
+_tmp="${TMP}/${SAMPLE}.chrM.per-base.tmp.gz"
+zcat "$CHRM_PERBASE_GZ" \
+  | awk '{ for (p=$2; p<$3; p++) print $1"\t"p"\t"(p+1)"\t"$4 }' \
+  | gzip -c > "$_tmp" \
+  || die "RLE expansion failed (is /tmp full? try --keep-tmp and check $TMP)"
+mv "$_tmp" "$CHRM_PERBASE_GZ"
+
+# ----- define ratios to run -----
+if (( ALL )); then
+  RATIOS=("ND4/ND1" "ND5/ND1" "DLOOP/ND1" "mtDNA-CN")
+else
+  RATIOS=("$RATIO")
+fi
+
+_FIRST_ROW=1
+_ROTATED_BAM=""      # chrMC BAM, built once on first DLOOP/ND1 run, reused by --all
+_CHRMC_PERBASE_GZ="" # chrMC per-base, cached alongside _ROTATED_BAM
+_CORRECTED_GZ=""     # corrected chrM per-base (16569 bp, modulo-summed); used for ND1 ref
+
+# ----- per-ratio loop -----
+for RATIO in "${RATIOS[@]}"; do
+
+  SKIP_RATIO=0
+  _slug="${RATIO//\//_}"   # ND4/ND1 -> ND4_ND1
+  _slug="${_slug//-/_}"    # mtDNA-CN -> mtDNA_CN
+  T_BED="$TMP/target_${_slug}.bed"
+  R_BED="$TMP/ref_${_slug}.bed"
+  : > "$T_BED"
+  : > "$R_BED"
+
+  case "$RATIO" in
+    mtDNA-CN)
+      # target = ND1 on chrM
+      resolve_side target    "$MT_CHR" "$ND1_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+      # reference = B2M on chr15
+      if [[ -n "$REF_BED" ]]; then
+        [[ -e "$REF_BED" ]] || die "reference BED not found: $REF_BED"
+        cp "$REF_BED" "$R_BED"
+      elif [[ -n "$REF_RANGE" ]]; then
+        if [[ -z "$CHR15" ]]; then
+          log "skipping mtDNA-CN: --reference range given but chr15 not found in BAM header (chrM-only BAM)."
+          SKIP_RATIO=1
+        else
+          append_range "$CHR15" "$REF_RANGE" "$R_BED"
+        fi
+      else
+        if [[ -z "$CHR15" ]]; then
+          log "skipping mtDNA-CN: chr15 not found in BAM header (chrM-only BAM). Supply --reference-bed to use a custom B2M region."
+          SKIP_RATIO=1
+        else
+          BUILD=$(detect_build "$CHR15_LEN")
+          case "$BUILD" in
+            hg38/GRCh38)
+              printf '%s\t%s\t%s\n' "$CHR15" 44716176 44716271 > "$R_BED"
+              ;;
+            hg19/GRCh37)
+              printf '%s\t%s\t%s\n' "$CHR15" 45008374 45008469 > "$R_BED"
+              ;;
+            *)
+              log "could not auto-detect nuclear build from chr15 length=$CHR15_LEN."
+              log "For B2M coordinates on your reference, supply --reference-bed FILE."
+              log "Reference BED examples (1-based closed coords; B2M exon 2):"
+              log "  hg19/GRCh37: chr15  45008374  45008469"
+              log "  hg38/GRCh38: chr15  44716176  44716271"
+              die "unknown reference build for chr15 length=$CHR15_LEN"
+              ;;
+          esac
+          log "nuclear build auto-detected: $BUILD (chr15 length=$CHR15_LEN); using B2M as reference"
+        fi
+      fi
+      ;;
+    ND4/ND1)
+      resolve_side target    "$MT_CHR" "$ND4_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+      resolve_side reference "$MT_CHR" "$ND1_RANGE" "$R_BED" "$REF_RANGE"    "$REF_BED"
+      ;;
+    ND5/ND1)
+      resolve_side target    "$MT_CHR" "$ND5_RANGE" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+      resolve_side reference "$MT_CHR" "$ND1_RANGE" "$R_BED" "$REF_RANGE"    "$REF_BED"
+      ;;
+    DLOOP/ND1|D-LOOP/ND1|D-loop/ND1|dloop/ND1)
+      RATIO="DLOOP/ND1"
+      resolve_side target    "$MT_CHR" "${DLOOP_RANGES[*]}" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+      resolve_side reference "$MT_CHR" "$ND1_RANGE"        "$R_BED" "$REF_RANGE"    "$REF_BED"
+      ;;
+    custom)
+      [[ -n "$TARGET_RANGE" || -n "$TARGET_BED" ]] || die "--ratio custom requires --target or --target-bed"
+      [[ -n "$REF_RANGE"    || -n "$REF_BED"    ]] || die "--ratio custom requires --reference or --reference-bed"
+      resolve_side target    "$MT_CHR" "" "$T_BED" "$TARGET_RANGE" "$TARGET_BED"
+      resolve_side reference "$MT_CHR" "" "$R_BED" "$REF_RANGE"    "$REF_BED"
+      ;;
+    *)
+      die "unknown --ratio: '$RATIO' (allowed: mtDNA-CN, ND4/ND1, ND5/ND1, DLOOP/ND1, custom)"
+      ;;
+  esac
+
+  (( SKIP_RATIO )) && continue
+
+  sort_bed_inplace "$T_BED"
+  sort_bed_inplace "$R_BED"
+
+  [[ -s "$T_BED" ]] || die "target BED is empty (ratio: $RATIO)"
+  [[ -s "$R_BED" ]] || die "reference BED is empty (ratio: $RATIO)"
+
+  verify_bed_chroms "$T_BED" target
+  verify_bed_chroms "$R_BED" reference
+
+  if (( PRINT_BED )); then
+    log "--- [$RATIO] target BED ($T_BED) ---"
+    cat "$T_BED" >&2
+    log "--- [$RATIO] reference BED ($R_BED) ---"
+    cat "$R_BED" >&2
+  fi
+
+  # ── target coverage ──────────────────────────────────────────────────────
+  if [[ "$RATIO" == "DLOOP/ND1" ]]; then
+    # D-loop uses chrMC re-alignment to recover reads soft-clipped at the
+    # linear reference seam (chrM:16569→1).
+    #
+    # chrMC = rCRS (16569 bp) + first 700 bp appended → 17269 bp.
+    # 700 bp ≈ 2× mean insert size, capturing >99.9% of seam-crossing pairs.
+    # After re-alignment, a corrected chrM per-base file is built by folding
+    # chrMC back to 16569 bp (modulo-sum): positions 1–700 receive depth from
+    # both the start copy and the seam copy summed; positions 701–16569 are
+    # unchanged. D-loop (chrM:1-66 + chrM:16512-16569) and ND1 (chrM:3485-3553)
+    # are then extracted from this corrected file the same way as any other ratio.
+    #
+    # Build BWA index once (a few seconds, only if missing)
+    if [[ ! -f "${CHRMC_REF}.bwt" ]]; then
+      log "building BWA index for chrMC (one-time)..."
+      bwa index "$CHRMC_REF" 2>/dev/null || die "bwa index failed for $CHRMC_REF"
+    fi
+
+    # Re-align chrM reads to chrMC (cached: built once, reused if --all).
+    # Paired-end mode (R1+R2 separate files → bwa mem without -p) preserves
+    # mate-pair information, eliminating the ~1.16× coverage inflation seen
+    # with single-end re-alignment.
+    # Singletons (reads whose mate is not on chrM) are aligned separately
+    # in single-end mode so no chrM reads are lost.
+    if [[ -z "$_ROTATED_BAM" ]]; then
+      _ROTATED_BAM="$TMP/${SAMPLE}.chrMC.bam"
+      log "re-aligning chrM reads to chrMC (paired-end mode)..."
+      # Extraction: exclude supplementary (already partial alignments) +
+      # anything already excluded by FLAG (dup, secondary, QC-fail, unmapped).
+      _EXTRACT_FLAG=$(( FLAG | 2048 ))
+      # Split chrM reads into R1, R2, and singletons (one mate off-chrM).
+      # Using separate R1/R2 files avoids --interleave (added in samtools 1.21+).
+      _FQ_R1="$TMP/${SAMPLE}.R1.fq.gz"
+      _FQ_R2="$TMP/${SAMPLE}.R2.fq.gz"
+      _FQ_SE="$TMP/${SAMPLE}.se.fq.gz"
+      # Step 1: extract + collate chrM reads to a temp BAM (avoids process
+      # substitution inside a pipeline, which fails on many HPC environments).
+      _COLLATED_BAM="$TMP/${SAMPLE}.collated.bam"
+      samtools view -b -F "$_EXTRACT_FLAG" "${SAMTOOLS_REF_OPT[@]}" "$BAM" "$MT_CHR" \
+          2> >(grep -v "^\[W::" >&2) \
+        | samtools collate -O -u -@ "$THREADS" - "$TMP/collate" 2>/dev/null \
+        > "$_COLLATED_BAM" \
+        || die "failed to collate chrM reads"
+      # Step 2: split into R1, R2, and singletons (-s = paired read without its mate).
+      samtools fastq -1 "$_FQ_R1" -2 "$_FQ_R2" -s "$_FQ_SE" -0 /dev/null \
+                     -@ "$THREADS" "$_COLLATED_BAM" 2>/dev/null \
+        || die "failed to convert chrM reads to FASTQ"
+      rm -f "$_COLLATED_BAM"
+      # Align R1+R2 as paired-end, then singletons in single-end mode.
+      # Only one SAM header must reach samtools sort, so strip @-lines from
+      # the singleton bwa call when PE reads are also present.
+      {
+        if [[ -s "$_FQ_R1" ]]; then
+          bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                  <(gunzip -c "$_FQ_R1") <(gunzip -c "$_FQ_R2") 2>/dev/null
+          if [[ -s "$_FQ_SE" ]]; then
+            bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                    <(gunzip -c "$_FQ_SE") 2>/dev/null | grep -v '^@'
+          fi
+        elif [[ -s "$_FQ_SE" ]]; then
+          bwa mem -t "$THREADS" -v 1 -Y "$CHRMC_REF" \
+                  <(gunzip -c "$_FQ_SE") 2>/dev/null
+        fi
+      } | samtools sort -T "$TMP/sort" -@ "$THREADS" -o "$_ROTATED_BAM" \
+        || die "failed to create chrMC BAM"
+      rm -f "$_FQ_R1" "$_FQ_R2" "$_FQ_SE"
+      samtools index "$_ROTATED_BAM" || die "failed to index chrMC BAM"
+    fi
+
+    # chrMC per-base coverage (cached alongside _ROTATED_BAM)
+    if [[ -z "$_CHRMC_PERBASE_GZ" ]]; then
+      if (( ROTATE_PERBASE )); then
+        _CHRMC_PREFIX="${CHRM_OUT_DIR}/${SAMPLE}.chrMC"
+        log "computing chrMC per-base coverage → ${_CHRMC_PREFIX}.per-base.bed.gz"
+      else
+        _CHRMC_PREFIX="$TMP/${SAMPLE}.chrMC"
+        log "computing chrMC per-base coverage (temporary)..."
+      fi
+      _CHRMC_MDEPTH_FLAG=$(( FLAG | 2048 ))
+      mosdepth -t "$THREADS" -F "$_CHRMC_MDEPTH_FLAG" -c "chrMC" \
+        "$_CHRMC_PREFIX" "$_ROTATED_BAM" 2>/dev/null \
+        || die "mosdepth failed for chrMC per-base"
+      rm -f "${_CHRMC_PREFIX}.mosdepth.summary.txt" \
+             "${_CHRMC_PREFIX}.mosdepth.global.dist.txt"
+      # Expand RLE → one line per base position
+      _tmp="$TMP/${SAMPLE}.chrMC.per-base.tmp.gz"
+      zcat "${_CHRMC_PREFIX}.per-base.bed.gz" \
+        | awk '{ for (p=$2; p<$3; p++) print $1"\t"p"\t"(p+1)"\t"$4 }' \
+        | gzip -c > "$_tmp" \
+        || die "RLE expansion of chrMC per-base failed (is /tmp full?)"
+      mv "$_tmp" "${_CHRMC_PREFIX}.per-base.bed.gz"
+      _CHRMC_PERBASE_GZ="${_CHRMC_PREFIX}.per-base.bed.gz"
+
+      # Always build the corrected chrM per-base (16569 bp, modulo-summed).
+      # Positions in the appended zone (1 to EXT bp) receive depth from both
+      # chrMC copies (arm2a + arm2b); positions beyond EXT come from chrMC
+      # directly. Used for ND1 reference in DLOOP/ND1 (ND1 at 3441-3504 is
+      # well outside the appended zone so it is unaffected by the summing).
+      # Saved to outdir if --rotate-perbase, otherwise kept in TMP.
+      if (( ROTATE_PERBASE )); then
+        _CORRECTED_GZ="${CHRM_OUT_DIR}/${SAMPLE}.chrM.corrected.per-base.bed.gz"
+      else
+        _CORRECTED_GZ="$TMP/${SAMPLE}.chrM.corrected.per-base.bed.gz"
+      fi
+      log "building corrected chrM per-base (chrMC → 16569 bp)..."
+      zcat "$_CHRMC_PERBASE_GZ" \
+        | awk -v mt_chr="$MT_CHR" -v mt_len=16569 '
+            {
+              pos = $2 + 1
+              dep = $4 + 0
+              if (pos <= mt_len) { d[pos] += dep }
+              else               { d[pos - mt_len] += dep }
+            }
+            END {
+              for (i = 1; i <= mt_len; i++)
+                print mt_chr "\t" (i-1) "\t" i "\t" (i in d ? d[i] : 0)
+            }' \
+        | gzip -c > "$_CORRECTED_GZ" \
+        || die "failed to build corrected chrM per-base"
+    fi
+
+    # Extract D-loop depth from the corrected chrM per-base.
+    # The corrected file folds chrMC back to 16569 bp: positions 1-EXT have
+    # arm2a + arm2b already summed, so extracting chrM:1-66 and chrM:16512-16569
+    # directly gives the correct depth — identical to the 3-region formula but
+    # without the extra complexity.
+    # Custom --target falls back to the original chrM per-base (no correction).
+    _DLOOP_PERBASE="$_CORRECTED_GZ"
+    if [[ -n "$TARGET_RANGE" || -n "$TARGET_BED" ]]; then
+      log "warning: custom --target with DLOOP/ND1 — using original chrM per-base" \
+          "(chrMC correction applies to the default amplicon only)"
+      _DLOOP_PERBASE="$CHRM_PERBASE_GZ"
+    fi
+    if [[ "$STAT" == "median" ]]; then
+      T_MEAN=$(extract_from_perbase "$T_BED" "$_DLOOP_PERBASE" | calc_median)
+    else
+      T_MEAN=$(extract_from_perbase "$T_BED" "$_DLOOP_PERBASE" | calc_mean)
+    fi
+    log "D-loop coverage (corrected per-base): $T_MEAN"
+  else
+    # All other ratios: extract directly from chrM per-base
+    if [[ "$STAT" == "median" ]]; then
+      T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_median)
+    else
+      T_MEAN=$(extract_from_perbase "$T_BED" "$CHRM_PERBASE_GZ" | calc_mean)
+    fi
+  fi
+
+  # ── reference coverage ───────────────────────────────────────────────────────
+  # DLOOP/ND1: use the corrected chrM per-base so both target and reference
+  # come from the same re-aligned chrMC BAM (consistent denominator).
+  # All other ratios: use the original chrM per-base.
+  _REF_PERBASE="$CHRM_PERBASE_GZ"
+  if [[ "$RATIO" == "DLOOP/ND1" && -n "$_CORRECTED_GZ" ]]; then
+    _REF_PERBASE="$_CORRECTED_GZ"
+  fi
+
+  if [[ "$RATIO" == "mtDNA-CN" ]]; then
+    # mosdepth --use-median reports per-region median in col 4 (same output format as mean)
+    if [[ "$STAT" == "median" ]]; then
+      run_mosdepth_region "$WORK/${_slug}_reference" "$R_BED" --use-median
+    else
+      run_mosdepth_region "$WORK/${_slug}_reference" "$R_BED"
+    fi
+    R_MEAN=$(weighted_mean "$WORK/${_slug}_reference.regions.bed.gz")
+    rm -f "$WORK/${_slug}_reference.regions.bed.gz" \
+          "$WORK/${_slug}_reference.regions.bed.gz.csi" \
+          "$WORK/${_slug}_reference.mosdepth.summary.txt" \
+          "$WORK/${_slug}_reference.mosdepth.global.dist.txt" \
+          "$WORK/${_slug}_reference.mosdepth.region.dist.txt"
+  else
+    if [[ "$STAT" == "median" ]]; then
+      R_MEAN=$(extract_from_perbase "$R_BED" "$_REF_PERBASE" | calc_median)
+    else
+      R_MEAN=$(extract_from_perbase "$R_BED" "$_REF_PERBASE" | calc_mean)
+    fi
+  fi
+
+  RATIO_VAL=$(awk -v a="$T_MEAN" -v b="$R_MEAN" 'BEGIN{
+    if (a == "NA" || b == "NA") { print "NA"; exit }
+    if (b+0 == 0)               { print "NA"; exit }
+    printf "%.2f", (a+0)/(b+0)
+  }')
+
+  T_STR=$(fmt_regions "$T_BED")
+  R_STR=$(fmt_regions "$R_BED")
+
+  # print header once (before the first output row)
+  if (( _FIRST_ROW && ! NO_HEADER )); then
+    printf "sample\tratio\ttarget\treference\tstat\ttarget_cov\tref_cov\tratio_value\n"
+    _FIRST_ROW=0
+  fi
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$SAMPLE" "$RATIO" "$T_STR" "$R_STR" "$STAT" "$T_MEAN" "$R_MEAN" "$RATIO_VAL"
+
+done
