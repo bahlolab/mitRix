@@ -17,7 +17,7 @@ task mitRix {
         Int    cpus  = 4
 
         String memory      = "16G"
-        Int    preemptible = 2
+        Int    preemptible = 0
     }
 
     Int disk_space_int = ceil(1.2 * size([cram, crai, reference_fasta, reference_fasta_fai], "G"))
