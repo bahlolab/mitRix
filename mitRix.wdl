@@ -95,7 +95,7 @@ workflow mitRix_wf {
     }
 
     output {
-        File mitRix           = mitRix.tsv
+        File mitRix_tsv       = mitRix.tsv
         File base_cov2        = mitRix.chrm_perbase
         File chrm_perbase_csi = mitRix.chrm_perbase_csi
         File chrmc_perbase    = mitRix.chrmc_perbase
