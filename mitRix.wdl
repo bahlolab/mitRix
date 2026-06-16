@@ -32,7 +32,9 @@ task mitRix {
         source /usr/local/bin/_activate_current_env.sh
 
         # CRAM index must sit beside the CRAM file
-        ln -sf ~{crai} ~{cram}.crai
+        if [[ ! -f "~{cram}.crai" ]]; then
+            ln -sf ~{crai} ~{cram}.crai
+        fi
 
         mkdir -p outdir
 
