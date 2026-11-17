@@ -1,0 +1,11 @@
+region	build	contig	ranges
+# ThermoFisher 4-plex TaqMan amplicons (rCRS NC_012920.1; 1-based closed).
+# contig: mt = detected mtDNA contig, chr15 = detected chr15 contig.
+ND1	any	mt	3485-3553
+ND4	any	mt	12087-12170
+ND5	any	mt	12874-12969
+DLOOP	any	mt	1-66,16512-16569
+B2M	hg38	chr15	44716177-44716271
+B2M	hg19	chr15	45008375-45008469
+MAJOR	any	mt	8470-13447
+MINOR	any	mt	3307-5511

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# mitrix-legacy — v0.1.0 command line and 8-column output on top of `mitrix run`.
+# Used by the regression test (baseline_v0.1.0/compare.sh, ROADMAP p1-12).
+#
+# Supports: --bam --sample --ratio --all --mean --median --flag --threads --outdir
+#           --reference-fasta --rotate-perbase --no-header --keep-tmp
+# Custom regions (--target/--reference/...): call the modules directly instead.
+
+set -euo pipefail
+LOG_PREFIX=mitRix
+source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+FLAG=1796   # v0.1.0 default (excludes duplicates)
+
+RATIO="ND4/ND1"; ALL=0; NO_HEADER=0; ROTATE=0; LEG_OUTDIR=""
+while (( $# )); do
+  case "$1" in
+    --ratio)          RATIO="${2:?}"; shift 2;;
+    --all)            ALL=1; shift;;
+    --no-header)      NO_HEADER=1; shift;;
+    --rotate-perbase) ROTATE=1; shift;;
+    --outdir)         LEG_OUTDIR="${2:?}"; shift 2;;
+    --target|--reference|--target-bed|--reference-bed|--print-bed)
+                      die "$1 is not supported by mitrix-legacy; run the module directly";;
+    --version)        echo "mitRix $MITRIX_VERSION"; exit 0;;
+    *)                std_opt "$@" || die "unknown option: $1"; shift "$STD_SHIFT";;
+  esac
+done
+[[ -n "$BAM" ]] || die "--bam is required"
+if [[ -z "$SAMPLE" ]]; then
+  SAMPLE=$(basename "$BAM"); SAMPLE="${SAMPLE%.bam}"; SAMPLE="${SAMPLE%.cram}"
+fi
+case "$RATIO" in D-LOOP/ND1|D-loop/ND1|dloop/ND1) RATIO="DLOOP/ND1";; esac
+
+if (( ALL )); then RATIOS=("ND4/ND1" "ND5/ND1" "DLOOP/ND1" "mtDNA-CN"); else RATIOS=("$RATIO"); fi
+declare -A MOD=([ND4/ND1]=damage [ND5/ND1]=damage [DLOOP/ND1]=d_loop_7s [mtDNA-CN]=copy_number)
+declare -A TN=([ND4/ND1]=ND4 [ND5/ND1]=ND5 [DLOOP/ND1]=DLOOP [mtDNA-CN]=ND1)
+declare -A RN=([ND4/ND1]=ND1 [ND5/ND1]=ND1 [DLOOP/ND1]=ND1 [mtDNA-CN]=B2M)
+mods=()
+for r in "${RATIOS[@]}"; do
+  [[ -n "${MOD[$r]:-}" ]] || die "unknown --ratio: '$r' (allowed: mtDNA-CN, ND4/ND1, ND5/ND1, DLOOP/ND1)"
+  [[ " ${mods[*]} " == *" ${MOD[$r]} "* ]] || mods+=("${MOD[$r]}")
+done
+
+make_tmpdir
+args=(run --bam "$BAM" --sample "$SAMPLE" --outdir "$TMP" --threads "$THREADS" --flag "$FLAG"
+      --stat "$STAT" --biomarkers "$(IFS=,; echo "${mods[*]}")")
+[[ -n "$FASTA" ]] && args+=(--reference-fasta "$FASTA")
+"$MITRIX_HOME/bin/mitrix" "${args[@]}"
+
+S="$TMP/$SAMPLE"
+cat "$S"/logs/*.log >&2
+
+# per-base files where v0.1.0 put them (--outdir, else the working directory)
+DEST="${LEG_OUTDIR:-$PWD}"; mkdir -p "$DEST"
+cp "$S/core/$SAMPLE.chrM.per-base.bed.gz"* "$DEST/"
+if (( ROTATE )) && [[ -e "$S/core/$SAMPLE.chrMC.per-base.bed.gz" ]]; then
+  cp "$S/core/$SAMPLE.chrMC.per-base.bed.gz"* "$S/core/$SAMPLE.chrM.corrected.per-base.bed.gz" "$DEST/"
+fi
+
+value() {  # module metric -> "value<TAB>qc"
+  awk -F'\t' -v m="$2" '$3==m { print $4 "\t" $6; exit }' "$S/$1/$SAMPLE.$1.tsv"
+}
+param() {  # module key
+  awk -F'\t' -v k="$2" '$1==k { print $2; exit }' "$S/$1/$SAMPLE.$1.params.tsv"
+}
+
+first=1
+for r in "${RATIOS[@]}"; do
+  m=${MOD[$r]}; t=${TN[$r]}; ref=${RN[$r]}
+  IFS=$'\t' read -r rv rqc <<< "$(value "$m" "${t}_${ref}_ratio_${STAT}")"
+  [[ "$rqc" == SKIPPED ]] && continue
+  IFS=$'\t' read -r tv _ <<< "$(value "$m" "${t}_depth_${STAT}")"
+  IFS=$'\t' read -r cv _ <<< "$(value "$m" "${ref}_depth_${STAT}")"
+  if (( first && ! NO_HEADER )); then
+    printf "sample\tratio\ttarget\treference\tstat\ttarget_cov\tref_cov\tratio_value\n"
+  fi
+  first=0
+  # v0.1.0 rounded both depths to 2 decimals, then divided the rounded values
+  awk -v OFS='\t' -v s="$SAMPLE" -v r="$r" -v tr="$(param "$m" "region.$t")" \
+      -v rr="$(param "$m" "region.$ref")" -v st="$STAT" -v a="$tv" -v b="$cv" 'BEGIN{
+    ta = (a == "NA") ? "NA" : sprintf("%.2f", a)
+    tb = (b == "NA") ? "NA" : sprintf("%.2f", b)
+    if (ta == "NA" || tb == "NA" || tb+0 == 0) rv = "NA"; else rv = sprintf("%.2f", (ta+0)/(tb+0))
+    print s, r, tr, rr, st, ta, tb, rv
+  }'
+done

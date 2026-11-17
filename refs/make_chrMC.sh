@@ -2,11 +2,11 @@
 # make_chrMC.sh — one-time setup: create the circularised rCRS reference
 #                 used by mitRix --rotate-chrm for accurate D-loop coverage.
 #
-# Strategy (based on MitoHPC; EXT=500 rather than MitoHPC default 300):
+# Strategy (based on MitoHPC; EXT=700 rather than MitoHPC default 300):
 #   chrMC = rCRS (16,569 bp) + first 700 bp of rCRS appended = 17,269 bp
 #   The artificial linear break moves from 16569/1 into the coding region,
-#   so the D-loop amplicon (orig 16536–16569 + 1–34) becomes the contiguous
-#   interval chrMC:16536–16603.
+#   so the D-loop amplicon (orig 16512–16569 + 1–66) becomes the contiguous
+#   interval chrMC:16512–16635.
 #   EXT=700 (≈ 2 × mean insert) captures seam-crossing read pairs with
 #   inserts up to ~850 bp, safely past the 99th percentile for typical WGS.
 #
@@ -71,5 +71,5 @@ echo "Done. Files in $SCRIPT_DIR/:"
 ls -lh "$OUT" "${OUT}".{amb,ann,bwt,pac,sa} 2>/dev/null | awk '{print "  "$0}'
 echo ""
 echo "D-loop amplicon coords in chrMC (used automatically with --ratio DLOOP/ND1):"
-echo "  original: chrM:16536-16569 + chrM:1-34  (split across break)"
-echo "  chrMC:    chrMC:16536-16603              (contiguous 68 bp)"
+echo "  original: chrM:16512-16569 + chrM:1-66  (split across break)"
+echo "  chrMC:    chrMC:16512-16635              (contiguous 124 bp)"

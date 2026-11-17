@@ -1,0 +1,15 @@
+start	end	note
+# rCRS positions (1-based, inclusive) excluded from heteroplasmy calls:
+# homopolymer / known artefact sites (user-supplied list, 2026-10-23).
+301	301	m.301
+302	302	m.302
+310	310	m.310
+316	316	m.316
+567	567	m.567 (568-573 poly-C; 567A>AC recurrent at ~20% HF in large WGS cohorts)
+3107	3107	m.3107 (rCRS N placeholder)
+5894	5894	m.5894
+16179	16179	m.16179
+16181	16183	m.16181-16183
+16188	16188	m.16188
+16189	16189	m.16189
+16192	16192	m.16192

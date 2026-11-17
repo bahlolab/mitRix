@@ -3,7 +3,7 @@
 # that mimics the wet-lab TaqMan Ct ratio.
 #
 # Output (TSV on stdout):
-#   sample  ratio  target  reference  target_mean_cov  ref_mean_cov  ratio_value
+#   sample  ratio  target  reference  stat  target_cov  ref_cov  ratio_value
 #
 # Built-in defaults follow the ThermoFisher 4-plex TaqMan amplicon
 # coordinates (rCRS = NC_012920.1, 16569 bp):
@@ -447,7 +447,7 @@ rm -f "${CHRM_PREFIX}.mosdepth.summary.txt" "${CHRM_PREFIX}.mosdepth.global.dist
 
 # Expand mosdepth RLE to one line per base position (makes the saved file
 # easier to inspect and use directly in R or other tools).
-# e.g. "chrM 3441 3504 5000" (63 positions) → 63 individual lines.
+# e.g. "chrM 3484 3553 5000" (69 positions) → 69 individual lines.
 log "expanding chrM per-base RLE → one line per position"
 _tmp="${TMP}/${SAMPLE}.chrM.per-base.tmp.gz"
 zcat "$CHRM_PERBASE_GZ" \
@@ -659,7 +659,7 @@ for RATIO in "${RATIOS[@]}"; do
       # Always build the corrected chrM per-base (16569 bp, modulo-summed).
       # Positions in the appended zone (1 to EXT bp) receive depth from both
       # chrMC copies (arm2a + arm2b); positions beyond EXT come from chrMC
-      # directly. Used for ND1 reference in DLOOP/ND1 (ND1 at 3441-3504 is
+      # directly. Used for ND1 reference in DLOOP/ND1 (ND1 at 3485-3553 is
       # well outside the appended zone so it is unaffected by the summing).
       # Saved to outdir if --rotate-perbase, otherwise kept in TMP.
       if (( ROTATE_PERBASE )); then

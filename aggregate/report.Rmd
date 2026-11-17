@@ -1,0 +1,378 @@
+---
+title: "mitRix cohort report"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+params:
+  cohort: ""
+  metadata: ""
+  subtype_col: "disease"
+  covariates: "age,sex,batch"
+  keep_flagged: false
+  adjusted_out: ""
+  mitrix_version: ""
+  outdir: ""
+  annotation: ""
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 110)
+suppressPackageStartupMessages(library(ggplot2))
+theme_set(theme_bw(base_size = 11))
+set.seed(42)
+kable <- function(x, ...) knitr::kable(x, format = "html", ...) |> kableExtra_free()
+kableExtra_free <- function(x) structure(x, class = c("knit_asis", class(x)))
+# backtick-quote names that are not syntactic (e.g. the 7S column) for formulas
+bt <- function(x) ifelse(make.names(x) == x, x, paste0("`", x, "`"))
+fmt_p <- function(p) ifelse(is.na(p), NA, formatC(p, digits = 2, format = "g"))
+has_glmnet <- requireNamespace("glmnet", quietly = TRUE)
+has_uwot   <- requireNamespace("uwot", quietly = TRUE)
+
+cohort <- read.delim(params$cohort, colClasses = "character", na.strings = "NA", check.names = FALSE)
+meta   <- read.delim(params$metadata, colClasses = "character", na.strings = c("NA", ""), check.names = FALSE)
+stopifnot("sample" %in% names(meta))
+
+# readouts: numeric cohort columns except QC ones
+qc_cols  <- c("sample", "qc_flag", "contamination", "contamination_level",
+              "haplogroup", "macro_haplogroup")
+readouts <- setdiff(names(cohort), qc_cols)
+for (r in c(readouts, "contamination_level")) if (r %in% names(cohort)) cohort[[r]] <- suppressWarnings(as.numeric(cohort[[r]]))
+readouts <- readouts[vapply(readouts, function(r) any(!is.na(cohort[[r]])), logical(1))]
+
+in_both   <- intersect(cohort$sample, meta$sample)
+no_meta   <- setdiff(cohort$sample, meta$sample)
+no_cohort <- setdiff(meta$sample, cohort$sample)
+d <- merge(cohort, meta, by = "sample")
+
+covars <- intersect(strsplit(params$covariates, ",")[[1]], names(meta))
+num_meta <- function(x) { y <- suppressWarnings(as.numeric(x)); if (sum(!is.na(y)) == sum(!is.na(x))) y else factor(x) }
+for (m in setdiff(names(meta), "sample")) d[[m]] <- num_meta(d[[m]])
+subtype <- if (params$subtype_col %in% names(d)) params$subtype_col else NA
+if (!is.na(subtype)) d[[subtype]] <- factor(d[[subtype]])
+
+# qc_flag tokens: "column:low_depth" only sets that column to NA for the sample (the
+# heteroplasmy module's low-HF metrics at low chrM depth); any other token excludes it
+soft_flags <- "low_depth"
+tokens <- strsplit(d$qc_flag, ";", fixed = TRUE)
+soft_na <- 0L
+for (i in seq_len(nrow(d))) for (t in tokens[[i]]) {
+  col <- sub(":.*", "", t)
+  if (grepl(":", t) && sub("^[^:]*:", "", t) %in% soft_flags && col %in% names(d)) {
+    d[[col]][i] <- NA; soft_na <- soft_na + 1L
+  }
+}
+flagged <- vapply(tokens, function(t) any(t != "PASS" & !(grepl(":", t) & sub("^[^:]*:", "", t) %in% soft_flags)), logical(1))
+a <- if (isTRUE(params$keep_flagged)) d else d[!flagged, , drop = FALSE]
+```
+
+**mitrix `r params$mitrix_version`** · cohort `r params$cohort` · metadata `r params$metadata`
+
+## QC summary
+
+```{r qc}
+qc <- data.frame(
+  item  = c("Samples in cohort table", "Samples in metadata", "In both (analysed set before QC)",
+            "In cohort, no metadata", "In metadata, not in cohort",
+            "Flagged (qc_flag not PASS)", "Used in analyses",
+            "Values set to NA (low_depth: low-HF heteroplasmy at low chrM depth)"),
+  n     = c(nrow(cohort), nrow(meta), length(in_both), length(no_meta), length(no_cohort),
+            sum(flagged), nrow(a), soft_na))
+kable(qc, col.names = c("", "n"))
+```
+
+`r if (length(no_meta)) paste("No metadata:", paste(no_meta, collapse = ", "))`
+`r if (length(no_cohort)) paste("Not in cohort:", paste(no_cohort, collapse = ", "))`
+
+```{r qc-flags, results = "asis"}
+if (any(flagged)) {
+  cat(if (isTRUE(params$keep_flagged)) "Flagged samples are **kept** (`--keep-flagged`):\n\n"
+      else "Flagged samples are **excluded** from the analyses below:\n\n")
+  print(kable(d[flagged, c("sample", "qc_flag")], row.names = FALSE))
+} else cat("No samples flagged.\n")
+```
+
+## Readouts
+
+```{r distributions, fig.height = 2.6 * ceiling(length(readouts) / 3)}
+long <- do.call(rbind, lapply(readouts, function(r)
+  data.frame(sample = a$sample, readout = r, value = a[[r]],
+             group = if (!is.na(subtype)) a[[subtype]] else "all")))
+ggplot(long, aes(group, value, colour = group)) +
+  geom_boxplot(outlier.shape = NA) + geom_jitter(width = 0.15, height = 0) +
+  facet_wrap(~readout, scales = "free_y", ncol = 3) +
+  labs(x = NULL, y = NULL, colour = if (!is.na(subtype)) subtype else NULL) +
+  theme(legend.position = "bottom")
+```
+
+```{r summary-table}
+st <- do.call(rbind, lapply(readouts, function(r) {
+  x <- a[[r]]
+  data.frame(readout = r, n = sum(!is.na(x)), mean = signif(mean(x, na.rm = TRUE), 4),
+             sd = signif(sd(x, na.rm = TRUE), 3), median = signif(median(x, na.rm = TRUE), 4),
+             min = signif(min(x, na.rm = TRUE), 4), max = signif(max(x, na.rm = TRUE), 4))
+}))
+kable(st, row.names = FALSE)
+```
+
+```{r by-batch, results = "asis", fig.height = 2.6 * ceiling(length(readouts) / 3)}
+if ("batch" %in% names(a)) {
+  cat("### By batch\n\n")
+  lb <- do.call(rbind, lapply(readouts, function(r)
+    data.frame(readout = r, value = a[[r]], batch = a$batch)))
+  print(ggplot(lb, aes(batch, value)) + geom_boxplot(outlier.shape = NA) +
+          geom_jitter(width = 0.15, height = 0) + facet_wrap(~readout, scales = "free_y", ncol = 3) +
+          labs(x = "batch", y = NULL))
+}
+```
+
+## Correlation between readouts
+
+Spearman correlation, pairwise complete.
+
+```{r correlation, fig.width = 6, fig.height = 5}
+cm <- cor(a[readouts], method = "spearman", use = "pairwise.complete.obs")
+cl <- as.data.frame(as.table(cm))
+ggplot(cl, aes(Var1, Var2, fill = Freq)) + geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3.5) +
+  scale_fill_gradient2(limits = c(-1, 1), low = "#3b6fb6", high = "#c0392b", mid = "white") +
+  labs(x = NULL, y = NULL, fill = "rho") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Batch adjustment and z-scores
+
+```{r adjust, results = "asis"}
+adj <- a[c("sample", readouts)]
+if ("batch" %in% names(a) && nlevels(droplevels(factor(a$batch))) > 1) {
+  for (r in readouts) {
+    fit <- lm(a[[r]] ~ factor(a$batch), na.action = na.exclude)
+    adj[[r]] <- residuals(fit) + mean(a[[r]], na.rm = TRUE)
+  }
+  cat("Each readout is adjusted for batch (linear model; batch effect removed, overall mean kept).\n\n")
+} else cat("No `batch` column with more than one level: no batch adjustment.\n\n")
+z <- adj; for (r in readouts) z[[r]] <- as.numeric(scale(adj[[r]]))
+out <- a[c("sample", readouts)]
+for (r in readouts) { out[[paste0(r, "_adj")]] <- adj[[r]]; out[[paste0(r, "_z")]] <- z[[r]] }
+if (nzchar(params$adjusted_out)) {
+  write.table(out, params$adjusted_out, sep = "\t", quote = FALSE, row.names = FALSE, na = "NA")
+  cat(sprintf("Raw, adjusted (`_adj`) and z-scored (`_z`) values: `%s`.\n", params$adjusted_out))
+}
+```
+
+## Covariate associations
+
+Each readout regressed on each covariate, adjusted for the other covariates in
+`r paste(covars, collapse = ", ")` where present. Numeric covariates: slope; categorical:
+F-test across levels. FDR (Benjamini–Hochberg) over the whole table.
+
+```{r assoc}
+assoc_vars <- unique(c(covars, if (!is.na(subtype)) subtype))
+res <- do.call(rbind, lapply(readouts, function(r) do.call(rbind, lapply(assoc_vars, function(v) {
+  adj_for <- setdiff(covars, v)
+  dd <- a[c(r, v, adj_for)]; dd <- dd[complete.cases(dd), , drop = FALSE]
+  dd <- dd[, c(TRUE, vapply(dd[-1], function(x) length(unique(x)) > 1, logical(1))), drop = FALSE]
+  if (!(v %in% names(dd)) || nrow(dd) < ncol(dd) + 2) return(NULL)
+  f <- reformulate(bt(setdiff(names(dd), r)), response = bt(r))
+  fit <- lm(f, data = dd); an <- drop1(fit, test = "F")
+  est <- if (is.numeric(dd[[v]])) signif(coef(fit)[[bt(v)]], 3) else NA
+  data.frame(readout = r, covariate = v, n = nrow(dd), effect = est, p = an[bt(v), "Pr(>F)"])
+}))))
+if (!is.null(res) && nrow(res)) {
+  res$FDR <- p.adjust(res$p, "BH"); res <- res[order(res$p), ]
+  res$p <- fmt_p(res$p); res$FDR <- fmt_p(res$FDR)
+  kable(res, row.names = FALSE)
+} else cat("Not enough data for covariate models.\n")
+```
+
+## Readouts by haplogroup
+
+```{r haplo, results = "asis", fig.height = 2.6 * ceiling(length(readouts) / 3)}
+if ("macro_haplogroup" %in% names(a) && any(!is.na(a$macro_haplogroup))) {
+  print(kable(as.data.frame(table(macro_haplogroup = a$macro_haplogroup)), row.names = FALSE))
+  lh <- do.call(rbind, lapply(readouts, function(r)
+    data.frame(readout = r, value = a[[r]], hg = a$macro_haplogroup)))
+  print(ggplot(lh, aes(hg, value)) + geom_boxplot(outlier.shape = NA) +
+          geom_jitter(width = 0.15, height = 0) + facet_wrap(~readout, scales = "free_y", ncol = 3) +
+          labs(x = "macro-haplogroup", y = NULL))
+  kw <- do.call(rbind, lapply(readouts, function(r) {
+    ok <- !is.na(a[[r]]) & !is.na(a$macro_haplogroup)
+    if (length(unique(a$macro_haplogroup[ok])) < 2) return(NULL)
+    data.frame(readout = r, p_kruskal = fmt_p(kruskal.test(a[[r]][ok], factor(a$macro_haplogroup[ok]))$p.value))
+  }))
+  if (!is.null(kw)) print(kable(kw, row.names = FALSE))
+} else cat("No haplogroup data.\n")
+```
+
+## Heteroplasmy spectrum and function
+
+```{r het-load, include = FALSE}
+het_file <- function(s) file.path(params$outdir, s, "heteroplasmy", paste0(s, ".heteroplasmy.variants.tsv"))
+hv <- if (nzchar(params$outdir)) do.call(rbind, lapply(a$sample, function(s)
+  if (file.exists(het_file(s))) read.delim(het_file(s), colClasses = "character", na.strings = ".")))
+has_het <- !is.null(hv) && nrow(hv) > 0
+if (has_het) {
+  hv$hf <- as.numeric(hv$hf)
+  if (!is.na(subtype)) hv$group <- a[[subtype]][match(hv$sample, a$sample)] else hv$group <- "all"
+}
+```
+
+```{r het-spectrum, results = "asis", eval = has_het, fig.height = 3.5}
+cat("Heteroplasmic SNVs pooled over the analysed samples. Strand: rCRS REF C/A = light (L),",
+    "G/T = heavy (H), written as the complement (Gupta et al., Nature 2026).",
+    "Age-accumulating: H C>T, H A>G and L A>G outside chrM:16172-210.\n\n")
+sn <- hv[!is.na(hv$strand), ]
+sn$class <- paste(sn$strand, sn$substitution)
+print(ggplot(sn, aes(class, fill = hf_bin)) + geom_bar() + facet_wrap(~group) +
+        labs(x = NULL, y = "heteroplasmic SNVs", fill = "HF bin") +
+        theme(axis.text.x = element_text(angle = 60, hjust = 1)))
+rt <- as.data.frame.matrix(table(region = ifelse(is.na(hv$region), "NA", hv$region), hf_bin = hv$hf_bin))
+print(kable(rt, caption = "Heteroplasmies by region and HF bin"))
+```
+
+```{r het-dnds, results = "asis", eval = has_het}
+# crude dN/dS: (observed / possible) nonsynonymous over synonymous SNVs, possible counts
+# from presets/mt_annotation.tsv.gz, excluding the MT-ATP8/ATP6 overlap (8527-8572);
+# not weighted by the mutation spectrum
+ann <- read.delim(gzfile(params$annotation), colClasses = "character")
+ann <- ann[!(as.integer(ann$pos) >= 8527 & as.integer(ann$pos) <= 8572), ]
+syn_cls <- "synonymous"; non_cls <- c("missense", "stop_gained", "start_lost", "stop_lost")
+pos_syn <- sum(ann$consequence %in% syn_cls); pos_non <- sum(ann$consequence %in% non_cls)
+hc <- hv[!is.na(hv$consequence) & !(as.integer(hv$pos) >= 8527 & as.integer(hv$pos) <= 8572), ]
+dn <- do.call(rbind, lapply(c("low", "high", "all"), function(b) {
+  x <- if (b == "all") hc else hc[hc$hf_bin == b, ]
+  o_non <- sum(x$consequence %in% non_cls); o_syn <- sum(x$consequence %in% syn_cls)
+  data.frame(HF_bin = b, nonsynonymous = o_non, synonymous = o_syn,
+             crude_dNdS = if (o_syn > 0) signif((o_non / pos_non) / (o_syn / pos_syn), 3) else NA)
+}))
+cat("Crude dN/dS: (observed / possible) nonsynonymous over synonymous heteroplasmic SNVs,",
+    "possible SNVs from the rCRS annotation, MT-ATP8/ATP6 overlap (8527-8572) excluded;",
+    "not weighted by the mutation spectrum, so use it to compare groups, not as an absolute value.\n\n")
+print(kable(dn, row.names = FALSE))
+gc <- as.data.frame(table(gene = hc$gene[hc$consequence %in% non_cls]))
+if (nrow(gc)) print(kable(gc[order(-gc$Freq), ], row.names = FALSE, col.names = c("gene", "nonsynonymous heteroplasmies")))
+```
+
+```{r subtype-setup, include = FALSE}
+run_subtype <- !is.na(subtype) && nlevels(droplevels(a[[subtype]])) >= 2
+if (run_subtype) {
+  zz <- z[match(a$sample, z$sample), readouts, drop = FALSE]
+  keep <- complete.cases(zz) & !is.na(a[[subtype]])
+  X <- as.matrix(zz[keep, , drop = FALSE]); rownames(X) <- a$sample[keep]
+  y <- droplevels(a[[subtype]][keep])
+  run_subtype <- nrow(X) >= 6 && nlevels(y) >= 2
+}
+ari <- function(x, y) {  # adjusted Rand index
+  tab <- table(x, y); c2 <- function(n) n * (n - 1) / 2
+  s <- sum(c2(tab)); a <- sum(c2(rowSums(tab))); b <- sum(c2(colSums(tab))); e <- a * b / c2(sum(tab))
+  if ((a + b) / 2 == e) return(NA); (s - e) / ((a + b) / 2 - e)
+}
+auc <- function(score, pos) {  # Mann-Whitney AUC
+  r <- rank(score); n1 <- sum(pos); n0 <- sum(!pos)
+  if (!n1 || !n0) return(NA); (sum(r[pos]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+```
+
+## Mito-disease subtypes
+
+```{r subtype-intro, results = "asis"}
+if (!run_subtype) {
+  cat(sprintf("No subtype analysis: needs a `%s` column in the metadata with at least 2 groups and 6 complete samples.\n", params$subtype_col))
+} else {
+  cat(sprintf("Readouts used (batch-adjusted, z-scored): %s. Samples per `%s`:\n\n",
+              paste(readouts, collapse = ", "), subtype))
+  print(kable(as.data.frame(table(y), responseName = "n"), col.names = c(subtype, "n")))
+  if (min(table(y)) < 10)
+    cat("\n**Small groups (< 10 per subtype): treat the results below as exploratory.**\n")
+}
+```
+
+### Unsupervised
+
+```{r pca, eval = run_subtype, fig.width = 7, fig.height = 4.5}
+pc <- prcomp(X)
+ve <- round(100 * pc$sdev^2 / sum(pc$sdev^2), 1)
+pd <- data.frame(pc$x[, 1:2], group = y, sample = rownames(X))
+ggplot(pd, aes(PC1, PC2, colour = group)) + geom_point(size = 3) +
+  geom_text(aes(label = sample), size = 2.6, vjust = -1, show.legend = FALSE) +
+  labs(x = sprintf("PC1 (%s%%)", ve[1]), y = sprintf("PC2 (%s%%)", ve[2]), colour = subtype)
+```
+
+```{r pca-loadings, eval = run_subtype}
+kable(round(pc$rotation[, 1:min(3, ncol(pc$rotation)), drop = FALSE], 2), caption = "PCA loadings")
+```
+
+```{r umap, eval = run_subtype && has_uwot, fig.width = 7, fig.height = 4.5}
+set.seed(42); um <- uwot::umap(X, n_neighbors = min(15, nrow(X) - 1), n_threads = 1)
+ud <- data.frame(UMAP1 = um[, 1], UMAP2 = um[, 2], group = y)
+ggplot(ud, aes(UMAP1, UMAP2, colour = group)) + geom_point(size = 3) + labs(colour = subtype)
+```
+
+```{r clustering, eval = run_subtype}
+k <- nlevels(y)
+km <- kmeans(X, centers = k, nstart = 50)$cluster
+hc <- cutree(hclust(dist(X), method = "ward.D2"), k = k)
+kable(data.frame(method = c("k-means", "hierarchical (Ward)"), k = k,
+                 ARI = round(c(ari(km, y), ari(hc, y)), 3)),
+      caption = "Agreement of clusters with subtypes (adjusted Rand index: 1 = identical, ~0 = chance)")
+```
+
+```{r clustering-tables, eval = run_subtype}
+kable(table(subtype = y, kmeans_cluster = km), caption = "Subtype × k-means cluster")
+```
+
+### Supervised (elastic net, nested cross-validation)
+
+```{r glmnet, eval = run_subtype, results = "asis"}
+strat_folds <- function(y, k) {  # stratified fold ids
+  f <- integer(length(y))
+  for (lv in levels(droplevels(y))) { i <- which(y == lv); f[i] <- sample(rep_len(seq_len(k), length(i))) }
+  f
+}
+if (!has_glmnet) {
+  cat("glmnet is not installed; supervised analysis skipped.\n")
+} else if (min(table(y)) < 4) {
+  cat(sprintf("Supervised analysis skipped: nested cross-validation needs at least 4 samples per subtype after QC (smallest: %d).\n", min(table(y))))
+} else {
+  K <- min(5, min(table(y)))
+  folds <- strat_folds(y, K)
+  fam <- if (nlevels(y) == 2) "binomial" else "multinomial"
+  prob <- matrix(NA_real_, length(y), nlevels(y), dimnames = list(rownames(X), levels(y)))
+  sel <- matrix(0, ncol(X), nlevels(y), dimnames = list(colnames(X), levels(y)))
+  for (f in seq_len(K)) {
+    tr <- folds != f; te <- !tr
+    ytr <- droplevels(y[tr])
+    nf <- min(5, min(table(ytr)))   # >= 3 since every subtype has >= 4 samples
+    cv <- suppressWarnings(glmnet::cv.glmnet(X[tr, , drop = FALSE], ytr, family = fam, alpha = 0.5,
+                                             foldid = strat_folds(ytr, nf), grouped = FALSE))
+    p <- predict(cv, X[te, , drop = FALSE], s = "lambda.min", type = "response")
+    prob[te, ] <- if (fam == "binomial") cbind(1 - as.numeric(p), as.numeric(p)) else p[, , 1]
+    cf <- coef(cv, s = "lambda.min")
+    if (fam == "binomial") sel[, 2] <- sel[, 2] + (as.numeric(cf[-1]) != 0)
+    else for (lv in levels(y)) sel[, lv] <- sel[, lv] + (as.numeric(cf[[lv]][-1]) != 0)
+  }
+  pred <- factor(levels(y)[max.col(prob, ties.method = "first")], levels = levels(y))
+  cat(sprintf("%s model, alpha = 0.5; outer %d-fold CV and inner CV for lambda, both stratified by subtype.\n\n",
+              fam, K))
+  aucs <- vapply(levels(y), function(lv) auc(prob[, lv], y == lv), numeric(1))
+  print(kable(data.frame(subtype = levels(y), n = as.integer(table(y)), AUC_one_vs_rest = round(aucs, 3)),
+              row.names = FALSE, caption = sprintf("Out-of-fold AUC; overall accuracy %.2f", mean(pred == y))))
+  print(kable(table(observed = y, predicted = pred), caption = "Confusion matrix (out-of-fold)"))
+  full <- suppressWarnings(glmnet::cv.glmnet(X, y, family = fam, alpha = 0.5,
+                                             foldid = strat_folds(y, K), grouped = FALSE))
+  cf <- coef(full, s = "lambda.min")
+  coefs <- if (fam == "binomial") matrix(as.numeric(cf[-1]), ncol = 1, dimnames = list(colnames(X), levels(y)[2]))
+           else sapply(levels(y), function(lv) as.numeric(cf[[lv]][-1]))
+  rownames(coefs) <- colnames(X)
+  print(kable(round(coefs, 3), caption = "Coefficients, model on all samples (lambda.min; z-scored readouts)"))
+  stab <- if (fam == "binomial") sel[, 2, drop = FALSE] else sel
+  print(kable(stab / K, digits = 2, caption = sprintf("Selection frequency across the %d outer folds", K)))
+}
+```
+
+---
+<small>Generated by `mitrix report`. Readouts: `r paste(readouts, collapse = ", ")`.
+R `r getRversion()`; glmnet `r if (has_glmnet) as.character(packageVersion("glmnet")) else "not installed"`;
+uwot `r if (has_uwot) as.character(packageVersion("uwot")) else "not installed"`.</small>

@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# mitrix — run mitRix core steps and biomarker modules for one sample.
+# See docs/module-contract.md and docs/module-conf.md.
+
+set -euo pipefail
+LOG_PREFIX=mitrix
+source "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+source "$MITRIX_HOME/lib/conf.sh"
+
+CORE_ORDER=(ref_context mt_coverage mt_circular mt_variants)
+
+usage() {
+  cat >&2 <<EOF
+mitrix v$MITRIX_VERSION — mtDNA biomarkers from BAM/CRAM
+
+USAGE
+  mitrix run --bam FILE --sample NAME --outdir DIR [options]
+  mitrix run --samplesheet SS --outdir DIR [options]   one run per samplesheet row
+  mitrix check  --samplesheet SS --outdir DIR      did every sample finish?
+  mitrix cohort --samplesheet SS --outdir DIR      one row per sample: DIR/cohort.tsv
+  mitrix prs --vcf NUCLEAR.vcf.gz --outdir DIR     polygenic scores (plink2): DIR/prs/
+  mitrix carriers --vcf NUCLEAR.vcf.gz --list NAME=FILE --outdir DIR
+                                                   carriers of listed nuclear variants
+  mitrix help MODULE        module options and metrics
+  mitrix list               available biomarker modules
+  mitrix --version
+
+RUN OPTIONS
+  --biomarkers LIST         comma-separated modules (default: all)
+  --opt MODULE='ARGS'       module options, e.g. --opt heteroplasmy='--hf-min 0.01'
+                            (repeatable; see: mitrix help MODULE)
+  --reference-fasta FA      required for CRAM
+  --threads N               default 4
+  --flag INT                SAM flag bits to exclude (default 2820: unmapped,
+                            secondary, QC-fail, supplementary; duplicates kept)
+  --stat mean|median        coverage statistic (also --mean / --median)
+  --keep-tmp                keep temporary directories
+
+MTDNA VARIANT CALLS (optional; heteroplasmy, haplogroup, contamination and
+pathogenic are SKIPPED without them)
+  --mt-variants FILE        variant calls for this sample: a VCF from MitoHPC/Mutect2,
+                            mity or another caller (FORMAT/AF or VAF), or mtDNA-Server 2
+                            variants.annotated.txt
+  --variants-sample NAME    sample name in that file (multi-sample files); default:
+                            --sample or the BAM/CRAM name (HG00096 also matches
+                            HG00096.final or HG00096.chrM.bam)
+  --caller NAME             mitohpc|mutect2|mity|mtdnaserver2|vcf; default: detected
+  --nuclear-depth X         nuclear (autosomal) sequencing depth, for the heteroplasmy
+                            NUMT ceiling; default: B2M depth from copy_number (needs the
+                            BAM), else a fixed ceiling. Samplesheet column nuclear_depth.
+  Haplogroup (HaploGrep3) and contamination (haplocheck) are computed from these
+  calls; install the tools once with tools/install.sh.
+  Variants-only mode: --mt-variants without --bam (samplesheet: empty or no 'bam'
+  column) runs haplogroup, contamination, heteroplasmy and pathogenic; chrM depth is
+  the median DP of the calls. copy_number, coverage_shape, damage and d_loop_7s are SKIPPED.
+
+SAMPLESHEET
+  TSV with a header. Required columns: sample, bam. Optional: reference_fasta,
+  mt_variants, variants_sample, caller, nuclear_depth. Relative paths are relative to the
+  samplesheet. Other options apply to every row.
+
+OUTPUT
+  DIR/NAME/NAME.tsv         all biomarkers (written only if every step succeeded)
+  DIR/NAME/NAME.status.tsv  one row per step
+  DIR/NAME/logs/STEP.log    stderr of each step
+
+MODULES
+$(list_modules)
+EOF
+}
+
+module_conf() { printf '%s/biomarkers/%s/module.conf' "$MITRIX_HOME" "$1"; }
+
+list_modules() {
+  local f
+  for f in "$MITRIX_HOME"/biomarkers/*/module.conf; do
+    printf '  %-14s %s\n' "$(conf_get "$f" name)" "$(conf_get "$f" description)"
+  done
+}
+
+all_modules() {
+  local f
+  for f in "$MITRIX_HOME"/biomarkers/*/module.conf; do basename "$(dirname "$f")"; done
+}
+
+# Run one `mitrix run` per samplesheet row; other args are passed to every row
+cmd_run_samplesheet() {  # samplesheet args...
+  local ss=$1; shift
+  local dir line n=0 failed=() cols=() vals=() i opt col v args
+  [[ -s "$ss" ]] || die "samplesheet not found or empty: $ss"
+  dir=$(cd "$(dirname "$ss")" && pwd)
+  IFS=$'\t' read -r -a cols < "$ss"
+  [[ " ${cols[*]} " == *" sample "* && ( " ${cols[*]} " == *" bam "* || " ${cols[*]} " == *" mt_variants "* ) ]] \
+    || die "samplesheet needs 'sample' and 'bam' (or 'mt_variants' for variants-only mode) columns"
+  for col in "${cols[@]}"; do
+    case "$col" in
+      sample|bam|reference_fasta|mt_variants|variants_sample|caller|nuclear_depth) ;;
+      mt_vcf|mitohpc_name) log "samplesheet: column '$col' is deprecated (use mt_variants / variants_sample)";;
+      haplogroup_tab|haplocheck_tab) die "samplesheet: column '$col' was removed in 0.4.0 (haplogroup and contamination are computed from mt_variants)";;
+      *) die "samplesheet: unknown column '$col'";;
+    esac
+  done
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # tab is whitespace to `read`, so runs of tabs (empty columns) would collapse;
+    # split on a non-whitespace separator instead
+    IFS=$'\x1f' read -r -a vals <<< "${line//$'\t'/$'\x1f'}"
+    args=()
+    for i in "${!cols[@]}"; do
+      v=${vals[$i]:-}
+      [[ -z "$v" || "$v" == NA ]] && continue
+      col=${cols[$i]}; opt="--${col//_/-}"
+      # paths relative to the samplesheet
+      case "$col" in sample|variants_sample|mitohpc_name|caller|nuclear_depth) ;; *) [[ "$v" == /* ]] || v="$dir/$v";; esac
+      args+=("$opt" "$v")
+    done
+    n=$((n + 1))
+    "$0" run "${args[@]}" "$@" || failed+=("${vals[0]}")
+  done < <(tail -n +2 "$ss")
+  log "samplesheet: $((n - ${#failed[@]}))/$n samples OK"
+  if (( ${#failed[@]} )); then log "failed: ${failed[*]}"; exit 1; fi
+}
+
+declare -A MODOPTS=()   # module -> extra options (from --opt)
+
+# Add a module and (first) its requires_modules to ORDERED; detects cycles
+declare -A VISIT=()
+ORDERED=()
+add_module() {  # name
+  local m=$1 dep f
+  f=$(module_conf "$m")
+  [[ -e "$f" ]] || die "unknown biomarker module: $m (see: mitrix list)"
+  case "${VISIT[$m]:-}" in
+    done) return;;
+    active) die "module dependency cycle involving $m";;
+  esac
+  VISIT[$m]=active
+  conf_validate "$f"
+  for dep in $(conf_get "$f" requires_modules); do add_module "$dep"; done
+  VISIT[$m]=done
+  ORDERED+=("$m")
+}
+
+has_inputs() {  # module.conf -> 0 if every requires_inputs is given
+  local i
+  for i in $(conf_get "$1" requires_inputs); do
+    case "$i" in
+      mt_variants)    [[ -n "$MT_VARIANTS" ]] || return 1;;
+      bam)            [[ -n "$BAM" ]] || return 1;;
+      *)              die "$1: unknown requires_inputs '$i'";;
+    esac
+  done
+}
+
+tool_version() {
+  case "$1" in
+    samtools) samtools --version 2>/dev/null | awk 'NR==1{print $2}';;
+    mosdepth) mosdepth --version 2>&1 | awk '{print $2; exit}';;
+    bwa)      bwa 2>&1 | awk '/^Version/{print $2; exit}';;
+  esac
+}
+
+check_tools() {  # tool[>=ver]...
+  local spec t min have
+  for spec in "$@"; do
+    t=${spec%%>=*}
+    case "$t" in  # Java tools from tools/install.sh
+      haplogrep3) [[ -s "$MITRIX_HAPLOGREP3" ]] || die "HaploGrep3 not found: $MITRIX_HAPLOGREP3 (run tools/install.sh, or set MITRIX_HAPLOGREP3; needed by: ${TOOL_USERS[$spec]})"; continue;;
+      haplocheck) [[ -s "$MITRIX_HAPLOCHECK" ]] || die "haplocheck not found: $MITRIX_HAPLOCHECK (run tools/install.sh, or set MITRIX_HAPLOCHECK; needed by: ${TOOL_USERS[$spec]})"; continue;;
+    esac
+    command -v "$t" >/dev/null 2>&1 || die "$t not found in PATH (needed by: ${TOOL_USERS[$spec]})"
+    [[ "$spec" == *">="* ]] || continue
+    min=${spec#*>=}
+    have=$(tool_version "$t")
+    if [[ -n "$have" ]] && [[ "$(printf '%s\n%s\n' "$min" "$have" | sort -V | head -1)" != "$min" ]]; then
+      die "$t $have is older than $min (needed by: ${TOOL_USERS[$spec]})"
+    fi
+  done
+}
+
+cmd_run() {
+  local biomarkers="" m c f spec a
+  for a in "$@"; do
+    if [[ "$a" == --samplesheet ]]; then
+      local rest=() ss=""
+      while (( $# )); do
+        if [[ "$1" == --samplesheet ]]; then ss="${2:?--samplesheet needs a value}"; shift 2
+        else rest+=("$1"); shift; fi
+      done
+      cmd_run_samplesheet "$ss" "${rest[@]}"
+      return
+    fi
+  done
+  while (( $# )); do
+    case "$1" in
+      --biomarkers) biomarkers="${2:?}"; shift 2;;
+      --opt)        [[ "${2:-}" == *=* ]] || die "--opt needs MODULE='ARGS'"
+                    MODOPTS[${2%%=*}]="${MODOPTS[${2%%=*}]:-} ${2#*=}"; shift 2;;
+      -h|--help)    usage; exit 0;;
+      *)            std_opt "$@" || die "unknown option: $1"; shift "$STD_SHIFT";;
+    esac
+  done
+  check_std_args
+  [[ -n "$biomarkers" ]] || biomarkers=$(all_modules | paste -sd,)
+
+  local requested
+  IFS=, read -r -a requested <<< "$biomarkers"
+  for m in "${requested[@]}"; do add_module "$m"; done
+  for m in "${!MODOPTS[@]}"; do
+    [[ " ${ORDERED[*]} " == *" $m "* ]] || die "--opt for '$m', which is not being run"
+  done
+
+  # variants-only mode (no BAM): modules that need the BAM are SKIPPED, not run
+  local nobam=()
+  if [[ -z "$BAM" ]]; then
+    local kept=()
+    for m in "${ORDERED[@]}"; do
+      if [[ " $(conf_get "$(module_conf "$m")" requires_inputs) " == *" bam "* ]]; then nobam+=("$m"); else kept+=("$m"); fi
+    done
+    ORDERED=("${kept[@]}")
+    log "variants-only mode (no --bam): ${nobam[*]:-nothing} skipped"
+  fi
+
+  # core steps needed, in fixed order; tools needed
+  declare -A NEED_CORE=() ; declare -gA TOOL_USERS=()
+  local core=() tools=()
+  for m in "${ORDERED[@]}"; do
+    f=$(module_conf "$m")
+    for c in $(conf_get "$f" requires_core); do
+      [[ -e "$MITRIX_HOME/core/$c.sh" ]] || die "$f: unknown core step '$c'"
+      NEED_CORE[$c]=1
+    done
+    # tools of a module whose inputs are not given are not needed (it writes SKIPPED)
+    has_inputs "$f" || continue
+    for spec in $(conf_get "$f" tools); do
+      [[ -n "${TOOL_USERS[$spec]:-}" ]] || tools+=("$spec")
+      TOOL_USERS[$spec]="${TOOL_USERS[$spec]:+${TOOL_USERS[$spec]} }$m"
+    done
+  done
+  NEED_CORE[ref_context]=1
+  if [[ -z "$BAM" ]]; then   # only the variant step; it writes a depth proxy for mt_coverage
+    unset 'NEED_CORE[ref_context]' 'NEED_CORE[mt_coverage]' 'NEED_CORE[mt_circular]'
+  fi
+  for c in "${CORE_ORDER[@]}"; do [[ -n "${NEED_CORE[$c]:-}" ]] && core+=("$c"); done
+  check_tools "${tools[@]}"
+
+  local sdir="$OUTDIR/$SAMPLE"
+  mkdir -p "$sdir/logs"
+  local status="$sdir/$SAMPLE.status.tsv"
+  printf 'step\tstatus\texit_code\tstart\tend\tversion\n' > "$status"
+  rm -f "$sdir/$SAMPLE.tsv"
+
+  local std_args=(--sample "$SAMPLE" --outdir "$OUTDIR" --threads "$THREADS"
+                  --flag "$FLAG" --stat "$STAT")
+  [[ -n "$BAM" ]] && std_args+=(--bam "$BAM")
+  [[ -n "$FASTA" ]] && std_args+=(--reference-fasta "$FASTA")
+  (( KEEP_TMP )) && std_args+=(--keep-tmp)
+  [[ -n "$MT_VARIANTS" ]]     && std_args+=(--mt-variants "$MT_VARIANTS")
+  [[ -n "$VARIANTS_SAMPLE" ]] && std_args+=(--variants-sample "$VARIANTS_SAMPLE")
+  [[ -n "$CALLER" ]]          && std_args+=(--caller "$CALLER")
+  [[ -n "${NUCLEAR_DEPTH:-}" ]] && std_args+=(--nuclear-depth "$NUCLEAR_DEPTH")
+
+  local failed=0 step version start end rc
+  run_step() {  # step version cmd...
+    step=$1 version=$2; shift 2
+    if (( failed )); then
+      printf '%s\tNOT_RUN\t\t\t\t%s\n' "$step" "$version" >> "$status"
+      return
+    fi
+    start=$(date +%FT%T)
+    log "$step ..."
+    rc=0; "$@" 2> "$sdir/logs/$step.log" || rc=$?
+    end=$(date +%FT%T)
+    if (( rc == 0 )); then
+      printf '%s\tOK\t0\t%s\t%s\t%s\n' "$step" "$start" "$end" "$version" >> "$status"
+    else
+      printf '%s\tFAILED\t%s\t%s\t%s\t%s\n' "$step" "$rc" "$start" "$end" "$version" >> "$status"
+      log "$step failed (exit $rc); last log lines:"
+      tail -5 "$sdir/logs/$step.log" >&2
+      failed=1
+    fi
+  }
+
+  for m in "${nobam[@]}"; do
+    printf '%s\tSKIPPED\t\t\t\t%s\n' "$m" "$(conf_get "$(module_conf "$m")" version)" >> "$status"
+  done
+  for c in "${core[@]}"; do
+    run_step "$c" "$MITRIX_VERSION" "$MITRIX_HOME/core/$c.sh" "${std_args[@]}"
+  done
+  local mopts
+  for m in "${ORDERED[@]}"; do
+    f=$(module_conf "$m")
+    read -r -a mopts <<< "${MODOPTS[$m]:-}"
+    run_step "$m" "$(conf_get "$f" version)" \
+      "$MITRIX_HOME/biomarkers/$m/$(conf_get "$f" entry)" "${std_args[@]}" "${mopts[@]}"
+  done
+
+  if (( failed )); then
+    log "sample $SAMPLE failed; $sdir/$SAMPLE.tsv not written (see $status)"
+    exit 1
+  fi
+  # A metric reported by several modules (ND1 depth: damage, d_loop_7s, copy_number)
+  # appears once, from the first module; each module's own table keeps its copy.
+  {
+    echo "$RESULT_HEADER"
+    for m in "${ORDERED[@]}"; do tail -n +2 "$sdir/$m/$SAMPLE.$m.tsv"; done \
+      | awk -F'\t' '!seen[$3]++'
+  } > "$sdir/$SAMPLE.tsv.tmp"
+  mv "$sdir/$SAMPLE.tsv.tmp" "$sdir/$SAMPLE.tsv"
+  log "done: $sdir/$SAMPLE.tsv"
+}
+
+case "${1:-}" in
+  run)          shift; cmd_run "$@";;
+  help)         [[ -n "${2:-}" ]] || { usage; exit 0; }
+                f=$(module_conf "$2"); [[ -e "$f" ]] || die "unknown module: $2"
+                exec "$MITRIX_HOME/biomarkers/$2/$(conf_get "$f" entry)" --help;;
+  list)         list_modules;;
+  check|cohort) c=$1; shift; exec "$MITRIX_HOME/aggregate/$c.sh" "$@";;
+  report)       shift; exec "$MITRIX_HOME/aggregate/report.sh" "$@";;
+  prs)          shift; exec "$MITRIX_HOME/aggregate/prs.sh" "$@";;
+  carriers)     shift; exec "$MITRIX_HOME/aggregate/carriers.sh" "$@";;
+  --version)    echo "mitrix $MITRIX_VERSION";;
+  ""|-h|--help) usage;;
+  *)            die "unknown command: $1 (see: mitrix --help)";;
+esac
