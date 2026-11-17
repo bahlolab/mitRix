@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1 — 2026-11-17
+
+### New
+
+- **`mitrix cohort --cn-clusters auto|off|K`** (default `auto`): mtDNA copy-number clusters
+  across the cohort (possible mixed DNA sources or batches). Gaussian mixture (mclust) on
+  log mtDNA-CN, K = 1-4 chosen by ICL with a minimum cluster size; columns `cn_cluster`
+  (1 = lowest CN) and `cn_cluster_prob`, soft flag `cn_cluster:uncertain` (prob < 0.9),
+  `cohort_cn_clusters.tsv` and `_fit.tsv`. Skipped with a warning without mclust.
+  Test: `tests/test_cn_cluster.sh`.
+
 ## 0.7.0 — 2026-11-17
 
 ### New

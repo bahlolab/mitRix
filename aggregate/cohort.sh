@@ -8,6 +8,9 @@
 # "contaminated" when the haplocheck contamination level is above --max-contamination
 # (default 0.02, as in Gupta et al., Nature 2026), and "high_heteroplasmy" when a sample
 # has more than --max-heteroplasmy (default 20) heteroplasmies.
+# --cn-clusters auto|off|K (default auto): mtDNA copy-number clusters (cn_cluster.R, mclust)
+# add cn_cluster, cn_cluster_prob and <outdir>/cohort_cn_clusters.tsv; skipped with a warning
+# when R or the mclust package is missing.
 
 set -euo pipefail
 LOG_PREFIX=cohort
@@ -15,7 +18,7 @@ HERE=$(dirname "$(readlink -f "$0")")
 source "$HERE/../lib/common.sh"
 source "$MITRIX_HOME/lib/conf.sh"
 
-SS=""; OUT=""; ALLOW=0; MAXCONT=0.02; MAXHET=20; PRS=""; CARR=""
+SS=""; OUT=""; ALLOW=0; MAXCONT=0.02; MAXHET=20; PRS=""; CARR=""; CNCL=auto
 while (( $# )); do
   case "$1" in
     --samplesheet)      SS="${2:?}"; shift 2;;
@@ -26,7 +29,8 @@ while (( $# )); do
     --max-heteroplasmy) MAXHET="${2:?}"; shift 2;;
     --prs)              PRS="${2:?}"; shift 2;;
     --carriers)         CARR="${2:?}"; shift 2;;
-    -h|--help)          echo "usage: mitrix cohort --samplesheet SS --outdir DIR [-o cohort.tsv] [--allow-incomplete] [--max-contamination 0.02] [--max-heteroplasmy 20] [--prs DIR/prs/prs.tsv] [--carriers DIR/carriers/carriers.tsv]" >&2; exit 0;;
+    --cn-clusters)      CNCL="${2:?}"; shift 2;;
+    -h|--help)          echo "usage: mitrix cohort --samplesheet SS --outdir DIR [-o cohort.tsv] [--allow-incomplete] [--max-contamination 0.02] [--max-heteroplasmy 20] [--prs DIR/prs/prs.tsv] [--carriers DIR/carriers/carriers.tsv] [--cn-clusters auto|off|K]" >&2; exit 0;;
     *)                  die "unknown option: $1";;
   esac
 done
@@ -35,6 +39,7 @@ done
 [[ -z "$CARR" || -s "$CARR" ]] || die "--carriers not found: $CARR (run mitrix carriers first)"
 [[ "$MAXCONT" =~ ^[0-9]*\.?[0-9]+$ ]] || die "--max-contamination must be a fraction: $MAXCONT"
 [[ "$MAXHET" =~ ^[0-9]+$ ]] || die "--max-heteroplasmy must be a count: $MAXHET"
+[[ "$CNCL" =~ ^(auto|off|[1-9])$ ]] || die "--cn-clusters must be auto, off or a number of clusters: $CNCL"
 OUT="${OUT:-$OUTDIR/cohort.tsv}"
 LONG="${OUT%.tsv}_long.tsv"
 
@@ -128,5 +133,17 @@ COLS="$COLS" CHECK="$CHECK" CARGROUP="$CARGROUP" awk -F'\t' -v OFS='\t' -v maxc=
       print "\t" (flags ? flags : "PASS")
     }
   }' "$LONG" > "$OUT"
+
+# mtDNA copy-number clusters (possible mixed DNA sources / batches)
+if [[ "$CNCL" != off ]]; then
+  if ! head -1 "$OUT" | tr '\t' '\n' | grep -qx mtDNA_CN; then
+    log "no mtDNA_CN column: cn_cluster skipped"
+  elif ! command -v Rscript >/dev/null || ! Rscript -e 'quit(status = !requireNamespace("mclust", quietly = TRUE))' >/dev/null 2>&1; then
+    log "warning: R package mclust not found: cn_cluster skipped (install.packages(\"mclust\"))"
+  else
+    Rscript "$HERE/cn_cluster.R" "$OUT" "${OUT%.tsv}_cn_clusters" "$CNCL" 2>&1 | while read -r l; do log "$l"; done \
+      || die "cn_cluster.R failed"
+  fi
+fi
 
 log "$(( $(wc -l < "$OUT") - 1 )) samples -> $OUT ($LONG)"

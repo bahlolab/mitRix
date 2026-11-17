@@ -38,7 +38,7 @@ stopifnot("sample" %in% names(meta))
 
 # readouts: numeric cohort columns except QC ones
 qc_cols  <- c("sample", "qc_flag", "contamination", "contamination_level",
-              "haplogroup", "macro_haplogroup")
+              "haplogroup", "macro_haplogroup", "cn_cluster", "cn_cluster_prob")
 readouts <- setdiff(names(cohort), qc_cols)
 for (r in c(readouts, "contamination_level")) if (r %in% names(cohort)) cohort[[r]] <- suppressWarnings(as.numeric(cohort[[r]]))
 readouts <- readouts[vapply(readouts, function(r) any(!is.na(cohort[[r]])), logical(1))]
@@ -56,7 +56,7 @@ if (!is.na(subtype)) d[[subtype]] <- factor(d[[subtype]])
 
 # qc_flag tokens: "column:low_depth" only sets that column to NA for the sample (the
 # heteroplasmy module's low-HF metrics at low chrM depth); any other token excludes it
-soft_flags <- "low_depth"
+soft_flags <- c("low_depth", "uncertain")   # cn_cluster:uncertain only blanks cn_cluster
 tokens <- strsplit(d$qc_flag, ";", fixed = TRUE)
 soft_na <- 0L
 for (i in seq_len(nrow(d))) for (t in tokens[[i]]) {

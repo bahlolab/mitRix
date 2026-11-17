@@ -29,7 +29,7 @@ Cohort commands:
 | Command | Output |
 |---|---|
 | `mitrix check` | did every sample finish? |
-| `mitrix cohort` | `cohort.tsv` (one row per sample, headline readouts, `qc_flag`) and `cohort_long.tsv` |
+| `mitrix cohort` | `cohort.tsv` (one row per sample, headline readouts, `qc_flag`) and `cohort_long.tsv`; flags mixed sample types or batches by clustering mtDNA copy number (`cn_cluster`) |
 | `mitrix prs` | polygenic scores for mtDNA copy number, heteroplasmy and 7S DNA traits (Gupta et al. GWAS) from a nuclear multi-sample VCF, with genetic-ancestry PCs (plink2) |
 | `mitrix carriers` | carriers of your listed nuclear variants (e.g. PD genes) from a nuclear VCF |
 
@@ -50,13 +50,13 @@ GC-adjusted versions or `gc_slope` as a covariate when comparing groups.
 ## Install
 
 Requirements: bash, samtools >= 1.10, mosdepth >= 0.3, bwa, bcftools, R >= 4.1 (packages
-MASS; ggplot2, rmarkdown, knitr for the report), Java >= 11 (HaploGrep3, haplocheck);
+MASS; mclust for `cn_cluster`; ggplot2, rmarkdown, knitr for the report), Java >= 11 (HaploGrep3, haplocheck);
 plink2 for `mitrix prs`.
 
 ```bash
 git clone https://github.com/bahlolab/mitRix.git
 cd mitRix
-conda create -n mitrix -c conda-forge -c bioconda samtools mosdepth bwa bcftools plink2 r-base r-mass openjdk
+conda create -n mitrix -c conda-forge -c bioconda samtools mosdepth bwa bcftools plink2 r-base r-mass r-mclust openjdk
 conda activate mitrix
 tools/install.sh                 # HaploGrep3 + haplocheck jars and the PhyloTree tree (once, needs internet)
 export PATH="$PWD/bin:$PATH"
@@ -121,6 +121,7 @@ missing samples. Full definitions: [docs/module-contract.md](docs/module-contrac
 bash tests/test_heteroplasmy.sh
 bash tests/test_pathogenic.sh
 bash tests/test_carriers.sh
+bash tests/test_cn_cluster.sh     # needs R package mclust
 bash tests/test_prs.sh           # needs plink2
 ```
 

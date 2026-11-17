@@ -214,7 +214,7 @@ HG00099   MISSING     no output directory
 `INCOMPLETE` means some steps have not finished (e.g. a job still running or killed).
 Exits `0` only if every sample is `OK`.
 
-### `mitrix cohort --outdir DIR --samplesheet SS [-o cohort.tsv] [--allow-incomplete] [--max-contamination 0.02]`
+### `mitrix cohort --outdir DIR --samplesheet SS [-o cohort.tsv] [--allow-incomplete] [--max-contamination 0.02] [--cn-clusters auto|off|K]`
 
 Runs `check` first and stops if any sample is not `OK`, unless `--allow-incomplete`
 is given (failed samples are then kept as rows of `NA`). Writes:
@@ -236,6 +236,19 @@ is given (failed samples are then kept as rows of `NA`). Writes:
   `INCOMPLETE` for samples kept with `--allow-incomplete` (their values are `NA`).
 - `cohort_long.tsv` — every row of every `<sample>.tsv`, for analyses that need more
   than the headline readouts.
+- `cn_cluster`, `cn_cluster_prob` (`--cn-clusters`, default `auto`; needs the R package
+  mclust): groups of mtDNA copy number in the cohort, e.g. mixed DNA sources (whole blood
+  vs cell line / PBMC) or batches. Gaussian mixtures (mclust, univariate equal- and
+  unequal-variance models) are fitted to log(`mtDNA_CN`) of samples whose `mtDNA_CN` is not
+  flagged. `auto` picks K = 1-4 by ICL, which penalises overlapping components so that one
+  skewed group is not split, and accepts K only if every cluster holds at least
+  max(10, 5% of samples); a number fixes K. Clusters are numbered by increasing mtDNA-CN
+  (1 = lowest) and are not labelled as tissues; with one group every sample is `1`.
+  `cn_cluster_prob` is the posterior probability of the assigned cluster; below 0.9
+  `qc_flag` gets `cn_cluster:uncertain` (a soft flag: the report only blanks `cn_cluster`).
+  `cohort_cn_clusters.tsv` gives per cluster n, median and geometric-mean CN, and the
+  chosen K and model; `cohort_cn_clusters_fit.tsv` the ICL and BIC of every K and model.
+  Skipped with a warning when mclust is not installed; `--cn-clusters off` disables it.
 - With `--carriers DIR/carriers/carriers.tsv` (`mitrix carriers --vcf NUCLEAR.vcf.gz
   --list NAME=FILE`): per user list, `NAME_n` (listed variants carried), `NAME_<GENE>`
   (listed ALT alleles carried per gene) and `NAME` (e.g. `LRRK2:p.Gly2019Ser(het)` or

@@ -2,7 +2,7 @@
 # Sourced by core steps, biomarker modules and bin/mitrix. Set LOG_PREFIX first.
 
 MITRIX_HOME=${MITRIX_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
-MITRIX_VERSION="0.7.0"
+MITRIX_VERSION="0.7.1"
 LOG_PREFIX=${LOG_PREFIX:-mitrix}
 
 # Java tools (tools/install.sh); override with the path to each .jar
